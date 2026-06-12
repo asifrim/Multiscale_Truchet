@@ -27,14 +27,14 @@ public class ControlWindow extends PApplet {
 
   ArrayList<Slider> sliders = new ArrayList<Slider>();
   Toggle tgWinged, tgInvert;
-  Button bShape, bScheme, bPrev, bNext, bRot, bSeed, bSave;
+  Button bShape, bScheme, bSym, bPrev, bNext, bRot, bSeed, bSave;
   Slider active = null;
 
   int palLabelY, swatchY, swatchH;
 
   ControlWindow(Multiscale_Truchet parent) { this.parent = parent; }
 
-  public void settings() { size(340, 470); }
+  public void settings() { size(340, 510); }
 
   public void setup() {
     surface.setTitle("Truchet — Controls");
@@ -54,6 +54,9 @@ public class ControlWindow extends PApplet {
     y += 40;
 
     bScheme = new Button("scheme: duotone", margin, y, width - 2 * margin, 30);
+    y += 40;
+
+    bSym = new Button("symmetry: none", margin, y, width - 2 * margin, 30);
     y += 44;
 
     palLabelY = y; y += 26;
@@ -84,6 +87,9 @@ public class ControlWindow extends PApplet {
 
     bScheme.label = "scheme: " + parent.schemeName(parent.colorScheme);
     drawButton(bScheme);
+
+    bSym.label = "symmetry: " + parent.SYMMETRY_NAMES[parent.symmetryMode];
+    drawButton(bSym);
 
     // palette name + swatches
     fill(170); textAlign(LEFT, CENTER);
@@ -155,6 +161,7 @@ public class ControlWindow extends PApplet {
     if (tgInvert.hit(mouseX, mouseY)) { tgInvert.value = !tgInvert.value; syncParent(); return; }
     if (bShape.hit(mouseX, mouseY))  { parent.shapeMode = (parent.shapeMode + 1) % 3; parent.redraw(); return; }
     if (bScheme.hit(mouseX, mouseY)) { parent.colorScheme = (parent.colorScheme + 1) % 5; parent.redraw(); return; }
+    if (bSym.hit(mouseX, mouseY))    { parent.symmetryMode = (parent.symmetryMode + 1) % 4; parent.redraw(); return; }
     if (bPrev.hit(mouseX, mouseY))   { parent.palettes.prev(); parent.redraw(); return; }
     if (bNext.hit(mouseX, mouseY))   { parent.palettes.next(); parent.redraw(); return; }
     if (bRot.hit(mouseX, mouseY))    { parent.palettes.current().rotate(); parent.redraw(); return; }
@@ -168,6 +175,7 @@ public class ControlWindow extends PApplet {
   public void mouseMoved() {
     bShape.hot  = bShape.hit(mouseX, mouseY);
     bScheme.hot = bScheme.hit(mouseX, mouseY);
+    bSym.hot    = bSym.hit(mouseX, mouseY);
     bPrev.hot   = bPrev.hit(mouseX, mouseY);
     bNext.hot   = bNext.hit(mouseX, mouseY);
     bRot.hot    = bRot.hit(mouseX, mouseY);

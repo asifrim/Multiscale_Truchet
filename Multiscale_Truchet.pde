@@ -52,7 +52,7 @@
 //
 //  Controls:  SPACE = new pattern  |  4/3/6 = square/triangle/hexagon
 //             P/p = prev/next palette  |  R = rotate palette  |  C = colour
-//             scheme  |  S = save PNG
+//             scheme  |  M = mirror symmetry  |  S = save PNG
 // ============================================================
 
 // Edges, clockwise:  0 = N (top), 1 = E (right), 2 = S (bottom), 3 = W (left)
@@ -65,6 +65,8 @@ int     seedVal       = 1;
 boolean winged        = true;   // Carlson wings (structural connections)
 boolean invertPerLevel= true;   // (duotone scheme) flip colours each scale level
 int     colorScheme   = 0;      // 0 = duotone, 1 = multi, 2 = gradient (see schemeName)
+int     symmetryMode  = 0;      // 0 = none, 1 = vertical axis, 2 = horizontal axis, 3 = both (see applySymmetry)
+String[] SYMMETRY_NAMES = { "none", "vertical", "horizontal", "quad" };
 
 // gradient scheme state (recomputed per draw; see setupGradient)
 color   gradSolid;              // the one solid colour (tile background)
@@ -135,7 +137,10 @@ void draw() {
     if (d == 0 && hexBatchUsed) strokeHexBatch();
   }
 
-  // 3. honour a save request from the control window (run here, on the
+  // 3. mirror symmetry: reflect the rendered pattern about grid-aligned axes.
+  applySymmetry();
+
+  // 4. honour a save request from the control window (run here, on the
   // viz thread, so the saved frame is the fully drawn one).
   if (saveRequested) {
     saveFrame("truchet-####.png");
@@ -149,6 +154,63 @@ void collectTile(Tile t) {
     for (Tile c : children(t)) collectTile(c);
   } else {
     leaves.add(t);
+  }
+}
+
+// ---- symmetry (mirroring) ----------------------------------------
+// Post-render mirroring: reflect the drawn pattern about an axis that lies on
+// a mirror line of the active grid, so the seam follows tile geometry. Pixel
+// mirroring makes the join seamless by construction: at the axis the reflected
+// copy equals the original, so any band crossing it continues into its mirror
+// image (the 1/3-2/3 crossing points are symmetric about the axis).
+
+// Spacing of the grid's vertical mirror lines. All three shapes share
+// L = width/gridN (for hexagons, hexW == width/gridN): squares mirror on grid
+// lines; triangles on vertex + edge-midpoint columns (L/2); hexagons on
+// centre + shared-edge columns (hexW/2).
+float symPitchX() {
+  float L = (float) width / gridN;
+  return shapeMode == 0 ? L : L / 2.0;
+}
+
+// Spacing of the grid's horizontal mirror lines: square grid lines; triangle
+// row lines; hexagon row-centre lines (vSpacing) -- all L or L*sqrt(3)/2.
+float symPitchY() {
+  float L = (float) width / gridN;
+  return shapeMode == 0 ? L : L * sqrt(3) / 2.0;
+}
+
+// First mirror line at or beyond the canvas centre, so the source strip
+// between the axis and the near border reflects exactly onto the far border.
+int symAxis(float centre, float pitch) {
+  return round(ceil(centre / pitch - 1e-4) * pitch);
+}
+
+void applySymmetry() {
+  if (symmetryMode == 0) return;
+  if (symmetryMode == 1 || symmetryMode == 3) {       // vertical axis: left -> right
+    int ax = symAxis(width / 2.0, symPitchX());
+    int sw = width - ax;
+    if (sw > 0 && ax - sw >= 0) {
+      PImage strip = get(ax - sw, 0, sw, height);
+      pushMatrix();
+      translate(2 * ax, 0);                           // screen x = 2*ax - drawn x
+      scale(-1, 1);
+      image(strip, ax - sw, 0);
+      popMatrix();
+    }
+  }
+  if (symmetryMode == 2 || symmetryMode == 3) {       // horizontal axis: top -> bottom
+    int ay = symAxis(height / 2.0, symPitchY());
+    int sh = height - ay;
+    if (sh > 0 && ay - sh >= 0) {
+      PImage strip = get(0, ay - sh, width, sh);
+      pushMatrix();
+      translate(0, 2 * ay);
+      scale(1, -1);
+      image(strip, 0, ay - sh);
+      popMatrix();
+    }
   }
 }
 
@@ -302,6 +364,10 @@ void keyPressed() {
     redraw();
   } else if (key == 'r' || key == 'R') {   // rotate the palette's colours
     palettes.current().rotate();
+    redraw();
+  } else if (key == 'm' || key == 'M') {   // cycle mirror symmetry
+    symmetryMode = (symmetryMode + 1) % 4;
+    println("symmetry: " + SYMMETRY_NAMES[symmetryMode]);
     redraw();
   } else if (key == '4') {                 // square
     setShape(0);

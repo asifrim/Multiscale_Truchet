@@ -34,7 +34,17 @@ Running opens **three windows**: the visualization, a **Controls** panel, and a
 below. Most parameters are adjustable live from the panels; the keyboard still
 works on the visualization window: **SPACE** = new seed, **4/3/6** =
 square/triangle/hexagon, **P/p** = prev/next palette, **R** = rotate palette,
-**C** = colour scheme, **S** = save `truchet-####.png`.
+**C** = colour scheme, **M** = mirror symmetry (none/vertical/horizontal/quad),
+**S** = save `truchet-####.png`.
+
+**Mirror symmetry** (`symmetryMode`, `applySymmetry()` in the main tab) is a
+post-render pixel reflection, applied in `draw()` after the tiles and before the
+save: the strip between the axis and the near border is `get()` and drawn back
+flipped onto the far side. The axis snaps to the grid's mirror line at or past
+the canvas centre (`symPitchX`/`symPitchY`: square = grid lines; triangle =
+side/2 columns and row lines; hexagon = hexW/2 columns and row-centre lines), so
+the seam follows tile geometry and — because the reflected copy equals the
+original along the axis — is seamless for every shape and colour scheme.
 
 ### Verifying changes
 
