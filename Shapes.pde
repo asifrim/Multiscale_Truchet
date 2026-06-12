@@ -37,6 +37,15 @@ int shapeMode = 0;                         // 0 = square, 1 = triangle, 2 = hexa
 String[] SHAPE_NAMES = { "square", "triangle", "hexagon" };
 int[]    SHAPE_N     = { 4, 3, 6 };
 
+// Whole-hexagon band batching (see drawPolyTile / strokeHexBatch). Hexagons are
+// all depth 0 and (except the per-tile mode 2) share one colour, so their bands
+// are accumulated into ONE path and stroked once -- a single antialiased shape
+// with no 1px seams where overlapping bands of separate tiles would otherwise meet.
+Path2D.Float hexBatch;
+boolean hexBatchUsed;
+color   hexBatchFg;
+float   hexBatchSide;
+
 // ---- a polygon tile --------------------------------------------
 class Tile {
   float cx, cy, R, rot;
@@ -194,9 +203,13 @@ void drawPolyTile(Tile t, color fg, color bg) {
   }
   float side = dist(vx[0], vy[0], vx[1], vy[1]);
 
-  // background polygon. Skipped in the gradient-bg scheme (3): the smooth canvas
-  // gradient (drawGradientBackground) shows through the tiling's negative space.
-  if (colorScheme != 3) {
+  // background polygon. Skipped when it would only repaint the canvas colour and
+  // could seam against neighbours:
+  //  (a) gradient-bg scheme (3): the smooth canvas gradient must show through;
+  //  (b) whole hexagons (n==6): a hexagon only ever exists at depth 0, so its bg
+  //      always equals the canvas colour -- drawing the opaque polygon lets a
+  //      later tile slice a 1px AA seam between overlapping bands at shared edges.
+  if (colorScheme != 3 && n != 6) {
     noStroke();
     fill(bg);
     beginShape();
@@ -204,18 +217,30 @@ void drawPolyTile(Tile t, color fg, color bg) {
     endShape(CLOSE);
   }
 
-  // motif. Square/triangle clip to the polygon (safety against wide arcs).
-  // Hexagon skips the clip so its ROUND-capped bands (see drawPolyConn) can
-  // overlap slightly across shared edges, closing the seam between neighbours.
-  boolean doClip = (n != 6);
-  java.awt.Shape oldClip = doClip ? pushPolyClip(vx, vy, n) : null;
-  for (int[] c : conns) drawPolyConn(c[0], c[1], n, vx, vy, mx, my, side, fg);
-  if (doClip) popPolyClip(oldClip);
+  // motif: all of this tile's bands as ONE stroked path (see drawTileBands), so
+  // overlapping bands form a single antialiased shape with no 1px seams/cusps
+  // between separately-drawn strokes. Square/triangle clip to the polygon (safety
+  // against wide arcs); hexagon skips the clip so its ROUND-capped bands overlap
+  // slightly across shared edges.
+  if (n == 6 && colorScheme != 2) {
+    // whole hexagons (uniform colour): defer the bands into the shared batch
+    // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
+    // is per-tile coloured, so it can't batch and falls through to per-tile.
+    for (int[] c : conns) appendConn(hexBatch, c[0], c[1], n, vx, vy, mx, my);
+    hexBatchUsed = true;
+    hexBatchFg   = fg;
+    hexBatchSide = side;
+  } else {
+    boolean doClip = (n != 6);
+    java.awt.Shape oldClip = doClip ? pushPolyClip(vx, vy, n) : null;
+    drawTileBands(conns, n, vx, vy, mx, my, side, fg);
+    if (doClip) popPolyClip(oldClip);
+  }
 
   // wings (unclipped): bg disc at each vertex (r = side/3), fg disc at each
   // edge midpoint (r = side/6) -- structural connection points across scales.
   // Whole hexagon tiles need no wings (they're a uniform coarse layer); their
-  // bands use ROUND caps (see drawPolyConn) to overlap across shared edges.
+  // bands use ROUND caps (see drawTileBands) to overlap across shared edges.
   // (A subdivided hexagon becomes n==3 triangles, which DO get wings.)
   if (winged && n != 6) {
     // Drawn in the default CENTER ellipseMode using DIAMETERS (2*radius). Do NOT
@@ -238,81 +263,67 @@ void drawPolyTile(Tile t, color fg, color bg) {
 // so each band's colour varies continuously across the canvas, not per tile.
 boolean gradientStroke() { return colorScheme == 4 && gradPaint != null; }
 
-// One connection: straight band for opposite edges, else a circular arc band.
-void drawPolyConn(int i, int j, int n,
-                  float[] vx, float[] vy, float[] mx, float[] my,
-                  float side, color fg) {
-  if (gradientStroke()) { drawConnG2(i, j, n, vx, vy, mx, my, side); return; }
-  stroke(fg);
-  strokeWeight(side / 3.0);
-  // hexagon bands overlap across edges with a ROUND cap (no clip there) -- the
-  // rounding bridges the anti-aliasing seam without the straight PROJECT cap's
-  // notch where a neighbour curves. Square/triangle end flush and use wings.
-  strokeCap(n == 6 ? ROUND : SQUARE);
-  noFill();
+// Draw all of a tile's bands as ONE Java2D stroked path. Stroking a single path
+// (with each connection as a subpath) makes the whole motif one antialiased
+// shape: overlapping bands union cleanly, with no 1px seams or cusps where
+// separately-drawn strokes would meet (their AA edges otherwise leave hairline
+// gaps). Solid colour, or the canvas gradient paint in the gradient-smooth scheme.
+void drawTileBands(int[][] conns, int n,
+                   float[] vx, float[] vy, float[] mx, float[] my,
+                   float side, color fg) {
+  if (conns.length == 0) return;              // blank tile
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  Path2D.Float path = new Path2D.Float();
+  for (int[] c : conns) appendConn(path, c[0], c[1], n, vx, vy, mx, my);
+  // hexagon bands overlap across edges with a ROUND cap (no clip there); square/
+  // triangle end flush (CAP_BUTT) and rely on wings to bridge the shared edge.
+  int cap = (n == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setStroke(new BasicStroke(side / 3.0, cap, BasicStroke.JOIN_ROUND));
+  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  g2.draw(path);
+}
 
-  int d = abs(i - j);
-  d = min(d, n - d);
-  if (n % 2 == 0 && d == n / 2) {            // opposite -> straight band
-    line(mx[i], my[i], mx[j], my[j]);
+// Stroke all accumulated whole-hexagon bands as ONE shape (uniform colour), so
+// overlapping bands of separate hexagons union with no 1px seams. Hexagons use a
+// ROUND cap and no clip (bands overlap across edges). Called from draw() after
+// the depth-0 pass, before finer (triangle) tiles draw on top.
+void strokeHexBatch() {
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  g2.setStroke(new BasicStroke(hexBatchSide / 3.0, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  g2.setPaint(gradientStroke() ? gradPaint : awtColor(hexBatchFg));
+  g2.draw(hexBatch);
+}
+
+// Append one connection to the path as a subpath: a straight band for opposite
+// edges, else the circular arc (centre = intersection of the two edge lines)
+// sampled into a polyline fine enough (~3px/segment) to read as smooth.
+void appendConn(Path2D.Float path, int i, int j, int n,
+                float[] vx, float[] vy, float[] mx, float[] my) {
+  int d = min(abs(i - j), n - abs(i - j));
+  if (n % 2 == 0 && d == n / 2) {             // opposite -> straight band
+    path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]);
     return;
   }
-
-  // arc centre = intersection of the two edge lines
   float[] c = lineIntersect(vx[i], vy[i], vx[(i + 1) % n], vy[(i + 1) % n],
                             vx[j], vy[j], vx[(j + 1) % n], vy[(j + 1) % n]);
-  if (c == null) { line(mx[i], my[i], mx[j], my[j]); return; }
-
+  if (c == null) { path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]); return; }
   float r  = dist(mx[i], my[i], c[0], c[1]);
   float a0 = atan2(my[i] - c[1], mx[i] - c[0]);
   float a1 = atan2(my[j] - c[1], mx[j] - c[0]);
-  float diff = a1 - a0;                       // shorter signed sweep -> interior arc
+  float diff = a1 - a0;                        // shorter signed sweep -> interior arc
   while (diff <= -PI) diff += TWO_PI;
   while (diff > PI)  diff -= TWO_PI;
-  float start = diff >= 0 ? a0 : a0 + diff;
-  float stop  = diff >= 0 ? a0 + diff : a0;
-  arc(c[0], c[1], 2 * r, 2 * r, start, stop);
+  int seg = max(8, ceil(r * abs(diff) / 3.0));
+  for (int k = 0; k <= seg; k++) {
+    float ph = a0 + diff * k / seg;
+    float px = c[0] + r * cos(ph), py = c[1] + r * sin(ph);
+    if (k == 0) path.moveTo(px, py); else path.lineTo(px, py);
+  }
 }
 
-// gradient-smooth scheme: stroke one connection as a Java2D path filled with the
-// gradient paint, so its colour varies continuously (not one colour per tile).
-// Honours the same g2 clip as the Processing path (square/triangle clip; hexagon
-// uses a ROUND cap to overlap across edges). Arcs are sampled into a polyline
-// fine enough to read as smooth.
-void drawConnG2(int i, int j, int n,
-                float[] vx, float[] vy, float[] mx, float[] my, float side) {
-  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  int cap = (n == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-  g2.setStroke(new BasicStroke(side / 3.0, cap, BasicStroke.JOIN_ROUND));
-  g2.setPaint(gradPaint);
-  Path2D.Float path = new Path2D.Float();
-  int d = abs(i - j); d = min(d, n - d);
-  if (n % 2 == 0 && d == n / 2) {             // straight band
-    path.moveTo(mx[i], my[i]);
-    path.lineTo(mx[j], my[j]);
-  } else {
-    float[] c = lineIntersect(vx[i], vy[i], vx[(i + 1) % n], vy[(i + 1) % n],
-                              vx[j], vy[j], vx[(j + 1) % n], vy[(j + 1) % n]);
-    if (c == null) {
-      path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]);
-    } else {
-      float r  = dist(mx[i], my[i], c[0], c[1]);
-      float a0 = atan2(my[i] - c[1], mx[i] - c[0]);
-      float a1 = atan2(my[j] - c[1], mx[j] - c[0]);
-      float diff = a1 - a0;
-      while (diff <= -PI) diff += TWO_PI;
-      while (diff > PI)  diff -= TWO_PI;
-      // sample the arc into a polyline fine enough (~3px/segment) that it reads
-      // as smooth even for large hexagon arcs; a fixed count facets big arcs.
-      int seg = max(8, ceil(r * abs(diff) / 3.0));
-      for (int k = 0; k <= seg; k++) {
-        float ph = a0 + diff * k / seg;
-        float px = c[0] + r * cos(ph), py = c[1] + r * sin(ph);
-        if (k == 0) path.moveTo(px, py); else path.lineTo(px, py);
-      }
-    }
-  }
-  g2.draw(path);
+// Processing colour int (0xAARRGGBB) -> opaque java.awt.Color.
+Color awtColor(color c) {
+  return new Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
 }
 
 // Fill a disc with the gradient paint (gradient-smooth wing edge-midpoint discs).

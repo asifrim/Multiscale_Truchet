@@ -44,7 +44,7 @@
 //  smooth gradient of the other colours fills the canvas, with the one solid
 //  colour as the ribbons); and gradient-smooth (the solid ground of gradient,
 //  but the ribbons are painted with the smooth gradient continuously, not per
-//  tile -- via a Java2D LinearGradientPaint; see Shapes.pde drawConnG2).
+//  tile -- via a Java2D LinearGradientPaint; see Shapes.pde drawTileBands).
 //
 //  Shapes (see Shapes.pde): square (multi-scale quadtree), triangle
 //  (multi-scale rep-tile), hexagon (multi-scale -- a hexagon is not a rep-tile,
@@ -73,7 +73,8 @@ float   gradCos, gradSin, gradMin, gradSpan;   // gradient axis + projection ran
 LinearGradientPaint gradPaint;  // Java2D paint matching the gradient (smooth schemes)
 
 PaletteManager palettes;        // colour source (see Palettes.pde), set in setup()
-ControlWindow  controls;        // secondary GUI window (see ControlWindow.pde), set in setup()
+ControlWindow  controls;        // parameter GUI window (see ControlWindow.pde), set in setup()
+TileWindow     tilesWin;        // per-shape tile-weight editor (see TileWindow.pde), set in setup()
 boolean saveRequested = false;  // set by the control window's Save button, handled in draw()
 
 // ---- tile alphabet ----------------------------------------------
@@ -100,10 +101,12 @@ void setup() {
   palettes = new PaletteManager();   // built-in COLOURlovers snapshot
   noLoop();
 
-  // launch the parameter GUI as its own window (separate PApplet); see
-  // ControlWindow.pde. It edits the globals above and calls redraw().
+  // launch the GUIs as separate PApplet windows. Each holds a reference back
+  // here, edits the globals above, and calls redraw() (the viz is noLoop()).
   controls = new ControlWindow(this);
   PApplet.runSketch(new String[]{"Controls"}, controls);
+  tilesWin = new TileWindow(this);
+  PApplet.runSketch(new String[]{"Tiles"}, tilesWin);
 }
 
 void draw() {
@@ -121,10 +124,16 @@ void draw() {
   leaves = new ArrayList<Tile>();
   for (Tile t : buildRoots()) collectTile(t);
 
-  // 2. draw coarse-first so finer tiles + wings land on top
-  for (int d = 0; d <= maxDepth; d++)
+  // 2. draw coarse-first so finer tiles + wings land on top. Whole hexagons
+  //    (all depth 0) are accumulated by drawPolyTile and stroked once here, as a
+  //    single antialiased shape -- no seams between their overlapping bands.
+  hexBatch = new Path2D.Float();
+  hexBatchUsed = false;
+  for (int d = 0; d <= maxDepth; d++) {
     for (Tile lf : leaves)
       if (lf.depth == d) drawPolyTile(lf, tileFg(lf), tileBg(lf));
+    if (d == 0 && hexBatchUsed) strokeHexBatch();
+  }
 
   // 3. honour a save request from the control window (run here, on the
   // viz thread, so the saved frame is the fully drawn one).
@@ -165,7 +174,7 @@ color tileBg(Tile t) {
 }
 
 // Foreground (band/wing) colour. (In gradient-smooth the bands are painted via
-// the Java2D gradient instead -- see gradientStroke()/drawConnG2 in Shapes.pde.)
+// the Java2D gradient instead -- see gradientStroke()/drawTileBands in Shapes.pde.)
 color tileFg(Tile t) {
   Palette p = palettes.current();
   if (colorScheme == 2 || colorScheme == 4) return gradientColor(t.cx, t.cy);  // gradient ribbons

@@ -14,8 +14,14 @@ or from the command line:
 processing-java --sketch=. --run
 ```
 
-A second **control window** opens alongside (see `ControlWindow.pde`) with
-sliders and buttons for every parameter below.
+Two extra windows open alongside the visualization:
+- a **Controls** window (`ControlWindow.pde`) with sliders/buttons for every
+  parameter below;
+- a **Tiles** window (`TileWindow.pde`) that previews each tile *archetype* of
+  the current shape (the base connection sets, without rotations) with a slider
+  per archetype setting how often it's chosen — i.e. it edits the active shape's
+  weight array live (`TILE_W` / `TRI_W` / `HEX_W`). Set one to 0 to drop that
+  tile; the relative values are the selection probabilities.
 
 ### Controls
 - **SPACE** — generate a new random pattern
@@ -108,22 +114,26 @@ split — a shared hexagon edge is one triangle edge, so the grid still meets. E
 shape has its own alphabet (`TILE_CONNS`, `TRI_CONNS`, `HEX_CONNS`) and is placed
 with a random rotation; `subdivideProb` controls how often hexagons triangulate.
 
-### Edges between neighbours
+### Rendering & seams
 
-Square and triangle tiles **clip their motif to the polygon** as a safety net
-(so a wide arc can't spill into a neighbour). Processing's `clip()` only takes a
-rectangle, so the renderer reaches the default JAVA2D backend's `Graphics2D` and
-sets the tile polygon as the clip region (`pushPolyClip` / `popPolyClip` in
-`Shapes.pde`); wings are drawn *after* the clip is released so they still spill.
+Each tile's whole motif is stroked as a **single Java2D path** (all of its bands
+in one `g2.draw`), so overlapping bands within a tile form one antialiased shape
+— no 1px gaps where separately-drawn strokes would meet. (Processing's `clip()`
+is rectangle-only, so the renderer reaches the JAVA2D backend's `Graphics2D`
+directly; see `Shapes.pde`.)
 
-Hexagons instead **skip the clip and use `ROUND` stroke caps**, so each band
-extends half its width past the edge and overlaps its neighbour's band. That
-closes the thin anti-aliasing seam that would otherwise show where two bands
-merely abut (square/triangle hide that seam under their wings; hexagons have
-none). A round cap is used rather than a square/projecting one so the overlap
-stays smooth where a neighbour curves — a projecting cap leaves a small notch
-there. The hexagon alphabet includes **distance-2 "sweeping" arcs** — the large
-curves spanning a tile; those stay within the hexagon by construction.
+Across tiles the schemes differ:
+- **Square / triangle** clip each motif to its polygon (a safety net against wide
+  arcs) and use **wings** — the foreground discs at edge midpoints bridge the
+  joins between neighbouring tiles.
+- **Whole hexagons** have no wings, so to avoid hairline seams between adjacent
+  tiles *all* hexagon bands are accumulated into **one path and stroked once**
+  (`strokeHexBatch`) — the entire hexagon layer becomes a single antialiased
+  shape with no internal seams. (They're all the same colour at depth 0; the
+  per-tile `gradient` scheme is the exception and falls back to per-tile.) Bands
+  use a `ROUND` cap so they overlap smoothly across edges. The hexagon alphabet
+  includes **distance-2 "sweeping" arcs** — large curves spanning a tile; those
+  stay within the hexagon by construction.
 
 ## Colour
 

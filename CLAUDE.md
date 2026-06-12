@@ -29,10 +29,11 @@ is a WSL mount of a Windows drive.
 The Processing sketch folder name must match the `.pde` filename, so the main
 sketch must stay named `Multiscale_Truchet.pde` at the repo root.
 
-Running opens **two windows**: the visualization and a **Controls** panel (see
-"Two-window architecture" below). Most parameters are adjustable live from the
-panel; the keyboard still works on the visualization window: **SPACE** = new
-seed, **4/3/6** = square/triangle/hexagon, **P/p** = prev/next palette,
+Running opens **three windows**: the visualization, a **Controls** panel, and a
+**Tiles** panel (per-shape archetype weights) — see "Multi-window architecture"
+below. Most parameters are adjustable live from the panels; the keyboard still
+works on the visualization window: **SPACE** = new seed, **4/3/6** =
+square/triangle/hexagon, **P/p** = prev/next palette, **R** = rotate palette,
 **C** = colour scheme, **S** = save `truchet-####.png`.
 
 ### Verifying changes
@@ -132,14 +133,23 @@ recursion; that breaks the layering. These constants (`s/3`, `s/6`) mirror
 Steele's `lineWidth` and `lineWidth/2`.
 
 The same invariant generalizes to n-gons (band width = `side/3`; arc radius from
-the edge-line intersection). A **whole hexagon tile skips wings**
-(`if (winged && n != 6)` in `drawPolyTile`) and uses fully-connected tiles +
-`ROUND` caps — the classic arc-at-midpoint connection, since at that level the
-tiles are uniform. (`ROUND`, not `PROJECT`: the round cap overlaps neighbours to
-hide the AA seam without the straight cap's notch where a neighbour curves.) Hexagons get multi-scale by **subdividing into 6 equilateral
-triangles** (a hexagon is not a rep-tile; see `children()`), and those triangles
-*do* use wings as usual. So hexagon mode mixes whole-hexagon tiles (coarse) with
-winged triangle detail (finer).
+the edge-line intersection). A **whole hexagon tile skips wings** (`winged && n !=
+6` in `drawPolyTile`) and uses fully-connected tiles — the classic arc-at-midpoint
+connection. Hexagons get multi-scale by **subdividing into 6 equilateral
+triangles** (a hexagon is not a rep-tile; see `children()`); those triangles *do*
+use wings. So hexagon mode mixes whole-hexagon tiles (coarse) with winged triangle
+detail (finer).
+
+**Seams / antialiasing.** Each tile's bands are stroked as ONE Java2D path
+(`drawTileBands`), so a tile's own bands union into a single antialiased shape (no
+1px gaps between separately-drawn strokes). Whole hexagons have no wings to bridge
+*inter*-tile joins, so **all hexagon bands are batched into one path and stroked
+once** (`strokeHexBatch`, called from `draw()` after the depth-0 pass) — the whole
+hexagon layer is a single AA shape, eliminating seams between tiles. They share
+one colour at depth 0 (the per-tile `gradient` scheme, mode 2, is the exception
+and falls back to per-tile via `colorScheme != 2` in `drawPolyTile`). Hexagon
+bands use a `ROUND` cap so they overlap smoothly across edges. Square/triangle
+keep per-tile clip + wings, which hide their joins.
 
 **Gotcha — `arc()` honours `ellipseMode`.** The tile arcs call
 `arc(cx, cy, 2*r, 2*r, ...)` assuming the default `CENTER` mode (args = width/
@@ -188,7 +198,7 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   continuously). The gradient family shares `setupGradient()`, which also builds
   a Java2D `LinearGradientPaint` (`gradPaint`) matching `gradientColor`'s
   projection; schemes 3 and 4 use it via `g2` (`drawGradientBackground` fills the
-  canvas; `gradientStroke()`/`drawConnG2`/`fillDiscG2` stroke the bands and wing
+  canvas; `gradientStroke()`/`drawTileBands`/`fillDiscG2` stroke the bands and wing
   discs). `tileFg`/`tileBg` take the `Tile` (gradient needs position). Keys
   `p`/`P` palettes, `R` rotate palette colour order (`Palette.rotate`), `C`
   scheme. There is no `cDark`/`cLight`. The gradient schemes pick via `random()`,
@@ -198,6 +208,14 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   via `runSketch`) with immediate-mode sliders/buttons writing straight to the
   main sketch's globals (`parent.*`) and calling `parent.redraw()`. If you add a
   tunable global, add a widget here too.
+- **`TileWindow.pde`** — a third PApplet window listing the active shape's tile
+  **archetypes** (`parent.connsFor(n)` — base connection sets, no rotations) with
+  a slider per archetype that writes its selection weight into
+  `parent.weightsFor(n)` (the same `TILE_W`/`TRI_W`/`HEX_W` `pickWeighted` reads)
+  and calls `parent.redraw()`. It draws each archetype with its own
+  `drawArchetype()` (a compact copy of the band geometry, using `parent.lineIntersect`)
+  since drawing must target *this* window's canvas, not the main one. It reads
+  `parent.shapeMode` each frame, so it relists automatically when the shape changes.
 
 Per-shape alphabets: `TILE_CONNS`/`TILE_W` (square, in the main tab), `TRI_CONNS`
 (triangle: blank + single arc — one port per edge allows at most one arc),
@@ -205,14 +223,16 @@ Per-shape alphabets: `TILE_CONNS`/`TILE_W` (square, in the main tab), `TRI_CONNS
 distance-2 "sweeping" arcs; a subdivided hexagon becomes triangles and uses
 `TRI_CONNS`). `connsFor(n)`/`weightsFor(n)` pick the right one.
 
-## Two-window architecture (control panel)
+## Multi-window architecture (control panels)
 
-The Controls panel is a **second `PApplet`**, not a GUI library. Processing
+The GUI panels are **separate `PApplet`s**, not a GUI library. Processing
 supports multiple windows by running additional `PApplet` instances; the main
-sketch's `setup()` launches `ControlWindow` with
-`PApplet.runSketch(new String[]{"Controls"}, controls)` and hands it a `parent`
-reference back to the main sketch. Widgets are drawn immediate-mode (custom
-sliders/toggles/buttons) — no G4P/ControlP5 dependency.
+sketch's `setup()` launches each with
+`PApplet.runSketch(new String[]{"..."}, win)` and hands it a `parent`
+reference back to the main sketch (currently two: `ControlWindow` and
+`TileWindow`). Widgets are drawn immediate-mode (custom sliders/toggles/buttons)
+— no G4P/ControlP5 dependency. The points below say "control window" but apply to
+both panels.
 
 Gotchas that matter when editing this:
 
