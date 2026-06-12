@@ -79,8 +79,7 @@ public class ControlWindow extends PApplet {
     drawToggle(tgWinged);
     drawToggle(tgInvert);
 
-    bShape.label = "shape: " + parent.SHAPE_NAMES[parent.shapeMode]
-                 + (parent.SHAPE_N[parent.shapeMode] == 6 ? " (1-scale)" : "");
+    bShape.label = "shape: " + parent.SHAPE_NAMES[parent.shapeMode];
     drawButton(bShape);
 
     bScheme.label = "scheme: " + parent.schemeName(parent.colorScheme);
@@ -155,7 +154,7 @@ public class ControlWindow extends PApplet {
     if (tgWinged.hit(mouseX, mouseY)) { tgWinged.value = !tgWinged.value; syncParent(); return; }
     if (tgInvert.hit(mouseX, mouseY)) { tgInvert.value = !tgInvert.value; syncParent(); return; }
     if (bShape.hit(mouseX, mouseY))  { parent.shapeMode = (parent.shapeMode + 1) % 3; parent.redraw(); return; }
-    if (bScheme.hit(mouseX, mouseY)) { parent.colorScheme = (parent.colorScheme + 1) % 3; parent.redraw(); return; }
+    if (bScheme.hit(mouseX, mouseY)) { parent.colorScheme = (parent.colorScheme + 1) % 5; parent.redraw(); return; }
     if (bPrev.hit(mouseX, mouseY))   { parent.palettes.prev(); parent.redraw(); return; }
     if (bNext.hit(mouseX, mouseY))   { parent.palettes.next(); parent.redraw(); return; }
     if (bRot.hit(mouseX, mouseY))    { parent.palettes.current().rotate(); parent.redraw(); return; }

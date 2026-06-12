@@ -22,7 +22,7 @@ sliders and buttons for every parameter below.
 - **4** / **3** / **6** — square / triangle / hexagon tiling
 - **p** / **P** — next / previous palette
 - **R** — rotate the current palette's colour order
-- **C** — cycle colour scheme (duotone → multi → gradient)
+- **C** — cycle colour scheme (duotone → multi → gradient → gradient-bg → gradient-smooth)
 - **S** — save the current frame as `truchet-####.png`
 
 ## How it works
@@ -93,15 +93,20 @@ implements three tilings (keys **4 / 3 / 6**), all through one renderer:
 |-------|---|--------------|-------------|
 | **Square** | 4 | yes | quadtree — 4 half-size squares |
 | **Triangle** | 3 | yes | rep-tile — 3 corner triangles + 1 flipped centre (the medial triangle) |
-| **Hexagon** | 6 | **no** | regular hexagons are not rep-tiles, so single-scale only |
+| **Hexagon** | 6 | yes | not a rep-tile, so it splits into 6 equilateral triangles (fanning from the centre) that then recurse |
 
 The square and triangle are genuine rep-tiles, so Carlson's recursive
 subdivision and the winged cross-scale connection both apply. A regular hexagon
-cannot be cut into smaller regular hexagons, so the hexagon mode is a single
-uniform scale; it uses **fully-connected tiles** (every edge paired) and **no
-wings** — the classic "arc crosses each edge at its midpoint" connection is
-enough when all tiles are the same size. Each shape has its own alphabet
-(`TILE_CONNS`, `TRI_CONNS`, `HEX_CONNS`) and is placed with a random rotation.
+*cannot* be cut into smaller regular hexagons, so a whole (un-subdivided) hexagon
+is a single tile drawn with **fully-connected tiles** (every edge paired) and
+**no wings** — the classic "arc crosses each edge at its midpoint" connection.
+When a hexagon subdivides it becomes **6 equilateral triangles** (each = centre +
+two adjacent vertices; the hexagon's side equals its circumradius, so they're
+equilateral), and those recurse with the triangle rep-tile rule. So hexagon mode
+mixes whole-hexagon tiles at the coarse scale with triangular detail where they
+split — a shared hexagon edge is one triangle edge, so the grid still meets. Each
+shape has its own alphabet (`TILE_CONNS`, `TRI_CONNS`, `HEX_CONNS`) and is placed
+with a random rotation; `subdivideProb` controls how often hexagons triangulate.
 
 ### Edges between neighbours
 
@@ -111,11 +116,13 @@ rectangle, so the renderer reaches the default JAVA2D backend's `Graphics2D` and
 sets the tile polygon as the clip region (`pushPolyClip` / `popPolyClip` in
 `Shapes.pde`); wings are drawn *after* the clip is released so they still spill.
 
-Hexagons instead **skip the clip and use `PROJECT` stroke caps**, so each band
+Hexagons instead **skip the clip and use `ROUND` stroke caps**, so each band
 extends half its width past the edge and overlaps its neighbour's band. That
 closes the thin anti-aliasing seam that would otherwise show where two bands
 merely abut (square/triangle hide that seam under their wings; hexagons have
-none). The hexagon alphabet includes **distance-2 "sweeping" arcs** — the large
+none). A round cap is used rather than a square/projecting one so the overlap
+stays smooth where a neighbour curves — a projecting cap leaves a small notch
+there. The hexagon alphabet includes **distance-2 "sweeping" arcs** — the large
 curves spanning a tile; those stay within the hexagon by construction.
 
 ## Colour
@@ -131,8 +138,20 @@ Two `colorScheme`s:
   scale level (darkest first, so the coarsest tiles get the boldest ribbon).
 - **gradient** (`2`): one palette colour, chosen at random, is the solid ground;
   the other colours form a gradient (in a random direction) that the bands sample
-  by position. The random pairing is fixed per seed — press **SPACE** for a new
-  one, or **R** to rotate the palette and re-pair the same structure.
+  by position — one colour per tile (so it steps slightly tile to tile).
+- **gradient-bg** (`3`): the flip, with *smooth* interpolation — a continuously
+  interpolated gradient of the other colours fills the whole canvas, and the one
+  random colour is the solid ribbons. The tiles skip their background fill so the
+  gradient shows through the negative space.
+- **gradient-smooth** (`4`): like `gradient` (solid ground, the others as the
+  ribbon colour) but the ribbons are painted with the gradient *continuously* —
+  a true gradient-filled stroke (Java2D `LinearGradientPaint`) so the colour
+  flows smoothly along the bands instead of stepping one flat colour per tile.
+
+For all three gradient schemes the random pairing is fixed per seed — press
+**SPACE** for a new one, or **R** to rotate the palette and re-pair the same
+structure. (`gradient` keeps the faceted, one-colour-per-tile look;
+`gradient-smooth` is the continuous version of it.)
 
 Cycle palettes with **p**/**P**, rotate the current palette's colour order with
 **R**, and cycle schemes with **C** at runtime. Palette rotation is most visible
@@ -149,7 +168,7 @@ All parameters live at the top of `Multiscale_Truchet.pde`:
 | `maxDepth` | how many times a cell may subdivide |
 | `subdivideProb` | how often cells split (higher = busier, finer detail) |
 | `shapeMode` | `0` square / `1` triangle / `2` hexagon (see Shapes) |
-| `colorScheme` | `0` duotone / `1` multi / `2` gradient (see Colour) |
+| `colorScheme` | `0` duotone / `1` multi / `2` gradient / `3` gradient-bg / `4` gradient-smooth (see Colour) |
 | `winged` | draw Carlson wings (structural connection discs) |
 | `invertPerLevel` | flip colours each scale level (duotone) |
 | `TILE_CONNS` / `TRI_CONNS` / `HEX_CONNS` | per-shape tile alphabets (in `Shapes.pde`) |

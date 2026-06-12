@@ -36,15 +36,19 @@
 //  wings) sit on top -- Carlson's "smaller tiles on top of larger".
 //  Colours still invert per scale level for contrast.
 //
-//  Colours come from the active palette (see Palettes.pde). Three schemes:
-//  duotone (palette's lightest/darkest, inverted per scale level), multi
-//  (constant light ground, a different palette colour per scale level), and
+//  Colours come from the active palette (see Palettes.pde). Five schemes:
+//  duotone (palette's lightest/darkest, inverted per scale level); multi
+//  (constant light ground, a different palette colour per scale level);
 //  gradient (one random solid colour as ground; bands sample a random-direction
-//  gradient of the other colours).
+//  gradient of the other colours, one flat colour per tile); gradient-bg (a
+//  smooth gradient of the other colours fills the canvas, with the one solid
+//  colour as the ribbons); and gradient-smooth (the solid ground of gradient,
+//  but the ribbons are painted with the smooth gradient continuously, not per
+//  tile -- via a Java2D LinearGradientPaint; see Shapes.pde drawConnG2).
 //
 //  Shapes (see Shapes.pde): square (multi-scale quadtree), triangle
-//  (multi-scale rep-tile), hexagon (single-scale -- regular hexagons are
-//  not rep-tiles). Select with keys 4 / 3 / 6.
+//  (multi-scale rep-tile), hexagon (multi-scale -- a hexagon is not a rep-tile,
+//  so it subdivides into 6 equilateral triangles that then recurse). Keys 4/3/6.
 //
 //  Controls:  SPACE = new pattern  |  4/3/6 = square/triangle/hexagon
 //             P/p = prev/next palette  |  R = rotate palette  |  C = colour
@@ -66,6 +70,7 @@ int     colorScheme   = 0;      // 0 = duotone, 1 = multi, 2 = gradient (see sch
 color   gradSolid;              // the one solid colour (tile background)
 color[] gradStops;              // the other colours, forming the band gradient
 float   gradCos, gradSin, gradMin, gradSpan;   // gradient axis + projection range
+LinearGradientPaint gradPaint;  // Java2D paint matching the gradient (smooth schemes)
 
 PaletteManager palettes;        // colour source (see Palettes.pde), set in setup()
 ControlWindow  controls;        // secondary GUI window (see ControlWindow.pde), set in setup()
@@ -108,7 +113,8 @@ void draw() {
   // Defensive: clear any polygon clip a previous frame may have left set (see
   // pushPolyClip in Shapes.pde) before we clear and redraw the canvas.
   ((PGraphicsJava2D) g).g2.setClip(null);
-  background(canvasBgColor());
+  if (colorScheme == 3) drawGradientBackground();   // smooth gradient fills the canvas
+  else background(canvasBgColor());
 
   // 1. build the top-level tiling for the active shape, then subdivide
   //    (square + triangle) collecting leaf tiles. (See Shapes.pde.)
@@ -138,37 +144,50 @@ void collectTile(Tile t) {
 }
 
 // ---- colour from the active palette -----------------------------
-String schemeName(int s) { return s == 0 ? "duotone" : s == 1 ? "multi" : "gradient"; }
+String schemeName(int s) {
+  switch (s) {
+    case 0:  return "duotone";
+    case 1:  return "multi";
+    case 2:  return "gradient";
+    case 3:  return "gradient-bg";
+    default: return "gradient-smooth";
+  }
+}
 
 // Tile background colour.
 color tileBg(Tile t) {
   Palette p = palettes.current();
-  if (colorScheme == 2) return gradSolid;                // gradient: solid ground
-  if (colorScheme == 1) return p.lightest();             // multi: constant light ground
-  boolean inv = invertPerLevel && (t.depth % 2 == 1);    // duotone: palette extremes
+  if (colorScheme == 2 || colorScheme == 4) return gradSolid;   // gradient ribbons: solid ground
+  if (colorScheme == 3) return gradientColor(t.cx, t.cy);       // gradient-bg: blend wing corner discs
+  if (colorScheme == 1) return p.lightest();                    // multi: constant light ground
+  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: palette extremes
   return inv ? p.darkest() : p.lightest();
 }
 
-// Foreground (band/wing) colour.
+// Foreground (band/wing) colour. (In gradient-smooth the bands are painted via
+// the Java2D gradient instead -- see gradientStroke()/drawConnG2 in Shapes.pde.)
 color tileFg(Tile t) {
   Palette p = palettes.current();
-  if (colorScheme == 2) return gradientColor(t.cx, t.cy);// gradient: sample by position
-  if (colorScheme == 1) return ribbonColor(p, t.depth);  // multi: a palette colour per level
-  boolean inv = invertPerLevel && (t.depth % 2 == 1);    // duotone: palette extremes
+  if (colorScheme == 2 || colorScheme == 4) return gradientColor(t.cx, t.cy);  // gradient ribbons
+  if (colorScheme == 3) return gradSolid;                       // gradient-bg: solid ribbons
+  if (colorScheme == 1) return ribbonColor(p, t.depth);         // multi: a palette colour per level
+  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: palette extremes
   return inv ? p.lightest() : p.darkest();
 }
 
 // Canvas clear colour (shows in overscan / tiny gaps).
 color canvasBgColor() {
-  return colorScheme == 2 ? gradSolid : palettes.current().lightest();
+  return (colorScheme == 2 || colorScheme == 4) ? gradSolid : palettes.current().lightest();
 }
 
-// Gradient scheme: one palette colour (chosen at random) is the solid tile
-// ground; the other colours form a gradient, in a random direction, that the
-// bands sample by position. Recomputed each draw -- a new seed (or palette
-// rotation) gives a new pairing. Uses random(), so draw() re-seeds afterwards.
+// Gradient schemes (2 and 3): one palette colour (chosen at random) is the solid
+// element; the other colours form a gradient, in a random direction. In scheme 2
+// the bands sample that gradient and the ground is solid; in scheme 3 the
+// background IS the (smooth) gradient and the bands are solid. Recomputed each
+// draw -- a new seed (or palette rotation) gives a new pairing. Uses random(),
+// so draw() re-seeds afterwards.
 void setupGradient() {
-  if (colorScheme != 2) return;
+  if (colorScheme < 2) return;   // schemes 2, 3, 4 are the gradient family
   Palette p = palettes.current();
   int n = p.size();
   int solidIdx = int(random(n));
@@ -187,16 +206,51 @@ void setupGradient() {
     lo = min(lo, pr); hi = max(hi, pr);
   }
   gradMin = lo; gradSpan = max(1, hi - lo);
+
+  // Build a matching Java2D paint for the smooth schemes (3, 4). The paint's
+  // start/end points are placed so its fraction equals gradientColor()'s t.
+  gradPaint = null;
+  if (gradStops.length >= 2) {
+    float sx = gradMin * gradCos,                sy = gradMin * gradSin;
+    float ex = (gradMin + gradSpan) * gradCos,   ey = (gradMin + gradSpan) * gradSin;
+    if (dist(sx, sy, ex, ey) > 1e-3) {
+      float[] fr = new float[gradStops.length];
+      Color[] cols = new Color[gradStops.length];
+      for (int i = 0; i < gradStops.length; i++) {
+        fr[i] = i / (float) (gradStops.length - 1);
+        int c = gradStops[i];
+        cols[i] = new Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+      }
+      gradPaint = new LinearGradientPaint(new Point2D.Float(sx, sy),
+                                          new Point2D.Float(ex, ey), fr, cols);
+    }
+  }
 }
 
-// Sample the band gradient at a point (gradient scheme).
-color gradientColor(float x, float y) {
+// Interpolate the gradient stops at parameter t in [0,1].
+color gradAt(float t) {
   if (gradStops == null || gradStops.length == 0) return color(0);
   if (gradStops.length == 1) return gradStops[0];
-  float t = constrain((x * gradCos + y * gradSin - gradMin) / gradSpan, 0, 1);
-  float seg = t * (gradStops.length - 1);
+  float seg = constrain(t, 0, 1) * (gradStops.length - 1);
   int i = min(int(seg), gradStops.length - 2);
   return lerpColor(gradStops[i], gradStops[i + 1], seg - i);
+}
+
+// Sample the gradient at a point (project onto the gradient axis, normalise).
+color gradientColor(float x, float y) {
+  return gradAt((x * gradCos + y * gradSin - gradMin) / gradSpan);
+}
+
+// Paint the whole canvas with the smooth gradient (scheme 3 background), using
+// the Java2D LinearGradientPaint so it is continuous (not stepped).
+void drawGradientBackground() {
+  if (gradPaint == null) {                   // <2 distinct stops: fall back to flat
+    background(gradStops != null && gradStops.length > 0 ? gradStops[0] : color(0));
+    return;
+  }
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  g2.setPaint(gradPaint);
+  g2.fill(new Rectangle2D.Float(0, 0, width, height));
 }
 
 // Multi-colour scheme: cycle the palette's non-background colours by scale
@@ -234,7 +288,7 @@ void keyPressed() {
     println("palette: " + palettes.current());
     redraw();
   } else if (key == 'c' || key == 'C') {   // cycle colour scheme
-    colorScheme = (colorScheme + 1) % 3;
+    colorScheme = (colorScheme + 1) % 5;
     println("colour scheme: " + schemeName(colorScheme));
     redraw();
   } else if (key == 'r' || key == 'R') {   // rotate the palette's colours
@@ -251,7 +305,6 @@ void keyPressed() {
 
 void setShape(int mode) {
   shapeMode = mode;
-  println("shape: " + SHAPE_NAMES[shapeMode]
-          + (SHAPE_N[shapeMode] == 6 ? " (single-scale)" : ""));
+  println("shape: " + SHAPE_NAMES[shapeMode]);
   redraw();
 }

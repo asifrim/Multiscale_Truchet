@@ -132,11 +132,14 @@ recursion; that breaks the layering. These constants (`s/3`, `s/6`) mirror
 Steele's `lineWidth` and `lineWidth/2`.
 
 The same invariant generalizes to n-gons (band width = `side/3`; arc radius from
-the edge-line intersection). **Hexagons are single-scale and skip wings**
-(`if (winged && n != 6)` in `drawPolyTile`): with uniform tile size the classic
-arc-at-midpoint connection suffices and the nubs only add noise, so the hexagon
-alphabet uses fully-connected tiles instead. Wings still matter for square and
-triangle, which mix scales.
+the edge-line intersection). A **whole hexagon tile skips wings**
+(`if (winged && n != 6)` in `drawPolyTile`) and uses fully-connected tiles +
+`ROUND` caps — the classic arc-at-midpoint connection, since at that level the
+tiles are uniform. (`ROUND`, not `PROJECT`: the round cap overlaps neighbours to
+hide the AA seam without the straight cap's notch where a neighbour curves.) Hexagons get multi-scale by **subdividing into 6 equilateral
+triangles** (a hexagon is not a rep-tile; see `children()`), and those triangles
+*do* use wings as usual. So hexagon mode mixes whole-hexagon tiles (coarse) with
+winged triangle detail (finer).
 
 **Gotcha — `arc()` honours `ellipseMode`.** The tile arcs call
 `arc(cx, cy, 2*r, 2*r, ...)` assuming the default `CENTER` mode (args = width/
@@ -161,8 +164,9 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   support landed. A `Tile` is `(cx, cy, R, rot, n, depth)`. `shapeMode`
   (0/1/2 → square/triangle/hexagon, keys 4/3/6) drives `buildRoots()`
   (`squareRoots`/`triangleRoots`/`hexagonRoots`) and `children()` (square
-  quadtree; triangle rep-tile = 3 corner + 1 flipped medial; hexagon never
-  subdivides — `canSubdivide` returns false for n=6). `drawPolyTile()` draws one
+  quadtree; triangle rep-tile = 3 corner + 1 flipped medial; hexagon = 6
+  equilateral triangles fanning from the centre, which then recurse as n==3 —
+  `canSubdivide` is just `depth < maxDepth`). `drawPolyTile()` draws one
   tile: a connection between edges `i,j` is a straight band if opposite
   (`min(|i−j|, n−|i−j|) == n/2`), else an arc whose centre is `lineIntersect()`
   of the two edge lines (radius = midpoint→centre). Band width `side/3`. Random
@@ -171,18 +175,25 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   polygon** as a safety net (`pushPolyClip`/`popPolyClip`, which reach the JAVA2D
   `Graphics2D` since Processing's `clip()` is rectangle-only); wings draw after
   the clip is released so they still spill. Hexagons skip the clip and use
-  `PROJECT` stroke caps so bands overlap across shared edges (closing the AA seam
+  `ROUND` stroke caps so bands overlap across shared edges (closing the AA seam
   that wings hide on the other shapes).
 - **`Palettes.pde`** — `PaletteManager`/`Palette`; colour source. `colorScheme`
-  (`schemeName`) selects duotone (palette lightest/darkest, inverted per level),
-  multi (`ribbonColor()`: light ground, one palette colour per level), or gradient
-  (`setupGradient`/`gradientColor`: one random solid colour as ground, bands
-  sample a random-direction gradient of the other colours). `tileFg`/`tileBg`
-  take the `Tile` (gradient needs position). Keys `p`/`P` palettes, `R` rotate
-  palette colour order (`Palette.rotate`), `C` scheme. There is no
-  `cDark`/`cLight`. Gradient picks via `random()`, so `draw()` re-seeds
-  (`randomSeed(seedVal)`) after `setupGradient()` to keep the tile layout
-  identical across schemes for a given seed.
+  (`schemeName`) selects one of four: duotone (lightest/darkest, inverted per
+  level), multi (`ribbonColor()`: light ground, one palette colour per level),
+  gradient (`gradientColor`: one random solid ground colour, bands sample a
+  random-direction gradient of the other colours, one flat colour per tile),
+  gradient-bg (a *smooth* full-canvas gradient, solid ribbons; `drawPolyTile`
+  skips the bg polygon when `colorScheme==3` so the gradient shows through), or
+  gradient-smooth (solid ground, ribbons painted with the smooth gradient
+  continuously). The gradient family shares `setupGradient()`, which also builds
+  a Java2D `LinearGradientPaint` (`gradPaint`) matching `gradientColor`'s
+  projection; schemes 3 and 4 use it via `g2` (`drawGradientBackground` fills the
+  canvas; `gradientStroke()`/`drawConnG2`/`fillDiscG2` stroke the bands and wing
+  discs). `tileFg`/`tileBg` take the `Tile` (gradient needs position). Keys
+  `p`/`P` palettes, `R` rotate palette colour order (`Palette.rotate`), `C`
+  scheme. There is no `cDark`/`cLight`. The gradient schemes pick via `random()`,
+  so `draw()` re-seeds (`randomSeed(seedVal)`) after `setupGradient()` to keep the
+  tile layout identical across schemes.
 - **`ControlWindow.pde`** — a second PApplet (own window, launched in `setup()`
   via `runSketch`) with immediate-mode sliders/buttons writing straight to the
   main sketch's globals (`parent.*`) and calling `parent.redraw()`. If you add a
@@ -190,9 +201,9 @@ Four `.pde` tabs (Processing merges them into one PApplet):
 
 Per-shape alphabets: `TILE_CONNS`/`TILE_W` (square, in the main tab), `TRI_CONNS`
 (triangle: blank + single arc — one port per edge allows at most one arc),
-`HEX_CONNS` (hexagon: fully-connected matchings only, since single-scale —
-including distance-2 "sweeping" arcs, which polygon clipping keeps in bounds).
-`connsFor(n)`/`weightsFor(n)` pick the right one.
+`HEX_CONNS` (whole-hexagon tiles: fully-connected matchings only — including
+distance-2 "sweeping" arcs; a subdivided hexagon becomes triangles and uses
+`TRI_CONNS`). `connsFor(n)`/`weightsFor(n)` pick the right one.
 
 ## Two-window architecture (control panel)
 
