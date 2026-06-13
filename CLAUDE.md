@@ -34,25 +34,101 @@ Running opens **three windows**: the visualization, a **Controls** panel, and a
 below. Most parameters are adjustable live from the panels; the keyboard still
 works on the visualization window: **SPACE** = new seed, **4/3/6** =
 square/triangle/hexagon, **P/p** = prev/next palette, **R** = rotate palette,
-**C** = colour scheme, **M** = mirror symmetry (none/vertical/horizontal/quad),
-**S** = save `truchet-####.png`.
+**C** = colour scheme, **M** = symmetry (none/vertical/horizontal/quad/rot 180/
+tile mir V/H/quad), **e** = toggle 3D extrusion, **E** = cycle extrude mode
+(oblique/1-point), **S** = save `truchet-####.png`.
 
-**Mirror symmetry** (`symmetryMode`, `applySymmetry()` in the main tab) is a
-post-render pixel reflection, applied in `draw()` after the tiles and before the
-save: the strip between the axis and the near border is `get()` and drawn back
-flipped onto the far side. The axis snaps to the grid's mirror line at or past
-the canvas centre (`symPitchX`/`symPitchY`: square = grid lines; triangle =
-side/2 columns and row lines; hexagon = hexW/2 columns and row-centre lines), so
-the seam follows tile geometry and — because the reflected copy equals the
-original along the axis — is seamless for every shape and colour scheme.
+**Symmetry** (`symmetryMode`) comes in two mechanisms, deliberately different:
+
+- **Pixel mirrors** (modes 1–3, `applySymmetry()` in the main tab) are a
+  post-render pixel reflection, applied in `draw()` after the tiles and before
+  the save: the strip between the axis and the near border is `get()` and drawn
+  back flipped onto the far side. The axis snaps to the grid's mirror line at or
+  past the canvas centre (`symPitchX`/`symPitchY`: square = grid lines; triangle
+  = side/2 columns and row lines; hexagon = hexW/2 columns and row-centre
+  lines), so the seam follows tile geometry and — because the reflected copy
+  equals the original along the axis — is seamless for every shape and colour
+  scheme. Cheap and works for both axes at once (quad), but the copied half's
+  drop shadows point the mirrored way.
+- **Tile-level modes** (4 = rot 180; 5/6/7 = tile mirror V/H/quad) are
+  structural: `draw()` generates only the fundamental domain (half or quadrant)
+  of roots and adds a transformed twin per leaf, then everything renders in one
+  normal pass — wings spill across the join both ways, layering holds, shadows
+  keep one light direction, and gradients stay continuous; no pixel seam exists.
+  (A pixel-copy rot 180 was tried first and rejected: a rotated copy does not
+  match the original pointwise along the seam, leaving orphaned wing-disc halves
+  and a hard shadow cut.) Each leaf's motif (`Tile.mi`/`mk`) is fixed in
+  `collectTile()` rather than rolled at draw time so twins can reuse it.
+  - **Rot 180** (mode 4): a half-turn twin is just `rot + PI` with the same
+    motif. The centre must be a **2-fold rotation centre of the grid**:
+    squares/triangles use `(width/2, grid/row line ≥ height/2)`; hexagons
+    rotate about a slanted-edge midpoint (`width/2 + hexW/4`, half-row line —
+    `rotCentreX/Y`), which maps hex row r → row 2·rs+1−r with the stagger
+    parity working out.
+  - **Tile mirrors** (modes 5 V / 6 H / 7 quad): a mirrored motif is drawn by
+    reversing the tile's vertex winding (`Tile.flip`, handled in `TileGeom`),
+    so no per-shape edge-relabelling tables are needed. The twins are
+    `(2·ax−cx, cy, PI−rot, flip)` for V, `(cx, 2·ay−cy, −rot, flip)` for H, and
+    `(2·ax−cx, 2·ay−cy, rot+PI, no-flip)` for the quad diagonal (= a
+    180-rotation, two reflections, so no winding flip). **Tile-level twinning
+    needs no *global* grid mirror line** — the reflected half is self-consistent
+    by construction, so only the seam matters: the axis may run along tile
+    edges/vertices or through tile centres, never cutting a body off-centre.
+    The vertical axis is `width/2` (the grid divides width exactly → a mirror
+    column of all three grids). The horizontal axis `mirrorAxisY()` snaps to the
+    nearest grid mirror line to mid-canvas (height is *not* divided evenly, so
+    it sits slightly off-centre): square `s0/2` line, triangle strip boundary
+    (`rowH` spacing — no straddlers; the up-triangle bases there tile
+    edge-to-edge and their flipped twins share those exact edges), or hexagon
+    row-centre line. A **straddler** (tile centred on an axis: odd-grid square
+    columns, one triangle per V-strip, every other hex row, etc.) is its own
+    mirror, so `collectSym()` recurses straddlers mirror-aware (far-side
+    children dropped — a twin covers them — and on-axis children kept) and
+    straddler leaves roll a **self-symmetric motif** (`pickSymmetricMotifMulti`
+    + `selfMirrorMotif`: keep the (mi, mk) pairs whose connection set maps onto
+    itself under the edge reflection `e → c0−1−e`, with `c0` per axis — vertical
+    `(PI−2·rot)/(2π/n)`, horizontal `−2·rot/(2π/n)` — and for quad straddlers,
+    symmetric about *both*; weighted as the normal roll conditioned on
+    symmetry). `addSymTwins()` emits the orbit (≤3 twins; an axis the tile
+    straddles fixes it, collapsing the diagonal onto the surviving reflection).
+    NB: because the H axis is off-centre, verifying H symmetry by pixel-diffing
+    against an *integer*-rounded reflected coordinate massively inflates the
+    mismatch on horizontal-ish edges (≈7%); reflect with the exact float axis
+    (e.g. PIL `AFFINE` + bicubic) and it drops to ≈0 — the symmetry is exact.
+
+A 4-fold (90°) mode is geometrically impossible on the non-square canvas
+(rotated sources fall off-canvas; tile twins would need a square-symmetric
+domain), so it is intentionally absent.
 
 ### Verifying changes
 
-Processing runs here, so prefer `processing-java --sketch=<abs path> --run` (or
-`--build` for a quick compile check). A Python+Pillow port of the algorithm also
-exists for rendering a preview PNG without a display (`preview.png` was produced
-this way). Either way, when changing the tile geometry, render and *look* at the
-result rather than assuming — the connection math is easy to get subtly wrong.
+**Never screenshot the windows** (scrot/xdotool are unreliable under WSLg and
+the user has forbidden it) — make the sketch render the image itself. A one-shot
+headless mode exists for exactly this (parsed in `setup()`, saved at the end of
+`draw()`):
+
+```sh
+TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 TRUCHET_SEED=7 \
+  processing-java --sketch=/mnt/e/Multiscale_Truchet --run
+```
+
+renders one frame to `TRUCHET_OUT` and exits, skipping the GUI windows.
+Optional overrides: `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon),
+`TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_SYM` (0–7),
+`TRUCHET_GRID`, `TRUCHET_DEPTH` (0 = single scale), `TRUCHET_SHADOW` (0/1),
+`TRUCHET_SHADOW_STR` (darkness 0–1), `TRUCHET_SHADOW_SIZE` (offset, fraction of
+the band stroke; unclamped here for exaggerated tests), `TRUCHET_SHADOW_GLOBAL`
+(0 = per-level mask, 1 = one full-scene mask), `TRUCHET_INVERT` (0/1 = duotone
+per-level colour inversion; off makes one hue always foreground — handy when a
+shadow on an inverted-level *background* reads as if the background were
+casting), `TRUCHET_EXTRUDE` (0/1 = 3D extrusion), `TRUCHET_EXTRUDE_MODE`
+(0 oblique, 1 one-point), `TRUCHET_VPX`/`TRUCHET_VPY` (vanishing point,
+normalised canvas coords, may be off-canvas), `TRUCHET_EXTRUDE_DEPTH` (fraction
+of tile side), `TRUCHET_EXTRUDE_SHADE` (side darkness 0–1). Use `--build` for a
+quick compile check. Python+Pillow ports of the algorithm also exist for geometry checks
+without Processing (`preview.png`, `trapezoid_prototype.py`). Either way, when
+changing the tile geometry, render and *look* at the result rather than
+assuming — the connection math is easy to get subtly wrong.
 
 ## Installing Processing in WSL (how the current install was built)
 
@@ -180,6 +256,38 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   layering winged tiles depend on. `collectTile()` either subdivides
   (`canSubdivide()` && `random < subdivideProb`) or records a leaf. Do not draw
   during recursion; it breaks the coarse-first layering.
+  **Drop shadows** render each depth level in three passes — all backgrounds,
+  then ONE unioned shadow mask (every caster offset by `shadowSize·side/3` along
+  `shadowAngle`, drawn opaque into an offscreen `BufferedImage`, composited once
+  at `shadowStrength`), then all foregrounds — so a shadow sits above its level's
+  backgrounds and below its bands with a single light direction, and same-level
+  shadows never double-darken (one mask). `shadowGlobal` (default off, toggle in
+  Controls) switches to ONE full-scene mask drawn after *all* backgrounds: coarse
+  tiles then cast across finer regions, at the cost of the per-level cue that
+  finer backgrounds occlude the coarser shadow beneath them. Shadow size scales
+  with `side`, so finer tiles cast proportionally finer shadows automatically.
+  **3D extrusion** (`extrude3D`, keys `e`/`E`, Controls toggle + mode button) is
+  a graffiti block-depth effect: the foreground ribbons gain solid side walls
+  extruded toward a vanishing point, viewed head-on (the tiling is NOT
+  perspective-warped). Reuses the shadow's offscreen-layer idea. When on, `draw()`
+  takes a separate branch: **all** backgrounds first (so a finer tile's background
+  can never chop a coarser ribbon's wall), then the optional drop shadow on that
+  flat plane, then per level coarse-first it calls `drawExtrudeLevel(d)` (build +
+  composite that level's walls) and draws the level's top faces on top — so finer
+  walls/faces land over coarser (Carlson's "smaller on top"). `drawExtrudeLevel`
+  builds the level's silhouette (band path + wing nubs) once, then re-draws it as
+  many overlapping "slices" stepping toward the VP into one ARGB `extrudeLayer`
+  (separate from `shadowLayer`): **oblique** translates each slice in parallel
+  (direction = canvas-centre→VP); **1-point** scales each slice about the VP
+  (`AffineTransform`, converging + thinner at the back). Every slice is the SAME
+  flat `sideColor()` (darkened palette `darkest()`), so the stack unions into one
+  clean wall with no internal seam (same-colour-over-same-colour), composited
+  once. Vector re-draw (not raster rescale) keeps the thin `side/3`/`side/6`
+  features crisp at every depth. Depth scales with the level's `side` (coarse
+  ribbons extrude deeper). Hex bands must be stroked by the body builder itself
+  (the `hexBatch` is top-face-only). Slice count N is derived from screen-space
+  travel and clamped (≤1200) so a near VP in 1-point can't explode it. Gated:
+  with `extrude3D` off, `draw()` is byte-for-byte the original path.
 - **`Shapes.pde`** — the generalized n-gon engine, added when triangle/hexagon
   support landed. A `Tile` is `(cx, cy, R, rot, n, depth)`. `shapeMode`
   (0/1/2 → square/triangle/hexagon, keys 4/3/6) drives `buildRoots()`
@@ -189,9 +297,10 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   `canSubdivide` is just `depth < maxDepth`). `drawPolyTile()` draws one
   tile: a connection between edges `i,j` is a straight band if opposite
   (`min(|i−j|, n−|i−j|) == n/2`), else an arc whose centre is `lineIntersect()`
-  of the two edge lines (radius = midpoint→centre). Band width `side/3`. Random
-  motif rotation = `rot + k·(2π/n)`, which keeps the footprint (so it still
-  tiles) and just relabels edges. Square/triangle **clip the motif to the tile
+  of the two edge lines (radius = midpoint→centre). Band width `side/3`. The
+  motif (alphabet index `mi` + rotation steps `mk`, chosen in `collectTile()` so
+  rot-180 twins can share it) rotates by `rot + mk·(2π/n)`, which keeps the
+  footprint (so it still tiles) and just relabels edges. Square/triangle **clip the motif to the tile
   polygon** as a safety net (`pushPolyClip`/`popPolyClip`, which reach the JAVA2D
   `Graphics2D` since Processing's `clip()` is rectangle-only); wings draw after
   the clip is released so they still spill. Hexagons skip the clip and use

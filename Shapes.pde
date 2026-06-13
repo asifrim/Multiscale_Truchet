@@ -32,6 +32,10 @@ import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
 import java.awt.geom.Ellipse2D;
 import java.awt.geom.Rectangle2D;
+import java.awt.geom.AffineTransform;
+import java.awt.AlphaComposite;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
 
 int shapeMode = 0;                         // 0 = square, 1 = triangle, 2 = hexagon
 String[] SHAPE_NAMES = { "square", "triangle", "hexagon" };
@@ -50,6 +54,10 @@ float   hexBatchSide;
 class Tile {
   float cx, cy, R, rot;
   int n, depth;
+  int mi = 0, mk = 0;     // motif: index into connsFor(n) + rotation steps; set in
+                          // collectTile so a symmetry twin can reuse its source's motif
+  boolean flip = false;   // mirror twin: reverse the vertex winding (see TileGeom),
+                          // which draws the exact mirror image of the motif
   Tile(float cx, float cy, float R, float rot, int n, int depth) {
     this.cx = cx; this.cy = cy; this.R = R; this.rot = rot;
     this.n = n; this.depth = depth;
@@ -181,82 +189,269 @@ ArrayList<Tile> children(Tile t) {
   return ch;
 }
 
-// ---- rendering one tile ----------------------------------------
-void drawPolyTile(Tile t, color fg, color bg) {
-  int n = t.n;
-  int[][][] alpha = connsFor(n);
-  float[]   w     = weightsFor(n);
-  int[][] conns = alpha[pickWeighted(w)];
-  float rot = t.rot + int(random(n)) * (TWO_PI / n);   // random motif rotation
+// ---- rendering one tile -----------------------------------------
+// A depth level renders in THREE PASSES (see draw() in the main tab):
+//   A. drawTileBackground -- polygon fill + bg corner wing discs
+//   B. addTileShadow      -- the level's single unioned drop-shadow layer
+//   C. drawTileForeground -- bands + fg edge-midpoint wing discs
+// so a tile's shadow falls across every same-level background (including the
+// neighbours' corner discs that spill onto it) yet stays beneath every
+// same-level band, regardless of tile order inside the level. The motif is
+// fixed on the Tile (mi/mk, chosen in collectTile), so all passes agree.
 
-  float[] vx = new float[n], vy = new float[n];
-  for (int k = 0; k < n; k++) {
-    float a = rot + TWO_PI * k / n;
-    vx[k] = t.cx + t.R * cos(a);
-    vy[k] = t.cy + t.R * sin(a);
+// Per-pass geometry of a placed tile: polygon vertices, edge midpoints, side.
+class TileGeom {
+  int n; int[][] conns;
+  float[] vx, vy, mx, my;
+  float side;
+  TileGeom(Tile t) {
+    n = t.n;
+    conns = connsFor(n)[t.mi];
+    // flip = mirror twin: wind the vertices the other way (and negate the motif
+    // rotation), which renders the exact mirror image of the source's motif --
+    // edge k of the flipped tile is the reflection of edge k of the source, so
+    // the connection list applies unchanged.
+    float dir = t.flip ? -1 : 1;
+    float rot = t.rot + dir * t.mk * (TWO_PI / n);   // motif rotation (chosen in collectTile)
+    vx = new float[n]; vy = new float[n];
+    for (int k = 0; k < n; k++) {
+      float a = rot + dir * TWO_PI * k / n;
+      vx[k] = t.cx + t.R * cos(a);
+      vy[k] = t.cy + t.R * sin(a);
+    }
+    mx = new float[n]; my = new float[n];
+    for (int k = 0; k < n; k++) {
+      int k2 = (k + 1) % n;
+      mx[k] = (vx[k] + vx[k2]) / 2;
+      my[k] = (vy[k] + vy[k2]) / 2;
+    }
+    side = dist(vx[0], vy[0], vx[1], vy[1]);
   }
-  float[] mx = new float[n], my = new float[n];
-  for (int k = 0; k < n; k++) {
-    int k2 = (k + 1) % n;
-    mx[k] = (vx[k] + vx[k2]) / 2;
-    my[k] = (vy[k] + vy[k2]) / 2;
-  }
-  float side = dist(vx[0], vy[0], vx[1], vy[1]);
+}
 
+// Pass A: the tile's background -- polygon fill, then the background half of
+// the wings (bg disc at each vertex, r = side/3, unclipped so it spills).
+void drawTileBackground(Tile t, color bg) {
+  TileGeom gm = new TileGeom(t);
   // background polygon. Skipped when it would only repaint the canvas colour and
   // could seam against neighbours:
   //  (a) gradient-bg scheme (3): the smooth canvas gradient must show through;
   //  (b) whole hexagons (n==6): a hexagon only ever exists at depth 0, so its bg
   //      always equals the canvas colour -- drawing the opaque polygon lets a
   //      later tile slice a 1px AA seam between overlapping bands at shared edges.
-  if (colorScheme != 3 && n != 6) {
+  if (colorScheme != 3 && gm.n != 6) {
     noStroke();
     fill(bg);
     beginShape();
-    for (int k = 0; k < n; k++) vertex(vx[k], vy[k]);
+    for (int k = 0; k < gm.n; k++) vertex(gm.vx[k], gm.vy[k]);
     endShape(CLOSE);
   }
 
-  // motif: all of this tile's bands as ONE stroked path (see drawTileBands), so
-  // overlapping bands form a single antialiased shape with no 1px seams/cusps
-  // between separately-drawn strokes. Square/triangle clip to the polygon (safety
-  // against wide arcs); hexagon skips the clip so its ROUND-capped bands overlap
-  // slightly across shared edges.
-  if (n == 6 && colorScheme != 2) {
-    // whole hexagons (uniform colour): defer the bands into the shared batch
-    // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
-    // is per-tile coloured, so it can't batch and falls through to per-tile.
-    for (int[] c : conns) appendConn(hexBatch, c[0], c[1], n, vx, vy, mx, my);
-    hexBatchUsed = true;
-    hexBatchFg   = fg;
-    hexBatchSide = side;
-  } else {
-    boolean doClip = (n != 6);
-    java.awt.Shape oldClip = doClip ? pushPolyClip(vx, vy, n) : null;
-    drawTileBands(conns, n, vx, vy, mx, my, side, fg);
-    if (doClip) popPolyClip(oldClip);
-  }
-
-  // wings (unclipped): bg disc at each vertex (r = side/3), fg disc at each
-  // edge midpoint (r = side/6) -- structural connection points across scales.
   // Whole hexagon tiles need no wings (they're a uniform coarse layer); their
   // bands use ROUND caps (see drawTileBands) to overlap across shared edges.
   // (A subdivided hexagon becomes n==3 triangles, which DO get wings.)
-  if (winged && n != 6) {
+  if (winged && gm.n != 6) {
     // Drawn in the default CENTER ellipseMode using DIAMETERS (2*radius). Do NOT
     // switch to ellipseMode(RADIUS): arc() also honours ellipseMode, so leaving
     // it on RADIUS makes later arc() calls (here and in the next frame) read
     // their diameter args as radii -- doubling the arcs into a chunky mess.
     noStroke();
     fill(bg);                                          // vertex discs, r = side/3
-    for (int k = 0; k < n; k++) ellipse(vx[k], vy[k], 2 * side / 3.0, 2 * side / 3.0);
-    if (gradientStroke()) {                            // edge-midpoint discs, r = side/6
-      for (int k = 0; k < n; k++) fillDiscG2(mx[k], my[k], side / 6.0);
+    for (int k = 0; k < gm.n; k++)
+      ellipse(gm.vx[k], gm.vy[k], 2 * gm.side / 3.0, 2 * gm.side / 3.0);
+  }
+}
+
+// Pass C: the tile's foreground -- bands as ONE stroked path (see
+// drawTileBands), so overlapping bands form a single antialiased shape with no
+// 1px seams/cusps between separately-drawn strokes; then the fg half of the
+// wings (disc at each edge midpoint, r = side/6 -- structural connection
+// points across scales). Square/triangle clip the bands to the polygon (safety
+// against wide arcs); hexagon skips the clip so its ROUND-capped bands overlap
+// slightly across shared edges.
+void drawTileForeground(Tile t, color fg) {
+  TileGeom gm = new TileGeom(t);
+  if (gm.n == 6 && colorScheme != 2) {
+    // whole hexagons (uniform colour): defer the bands into the shared batch
+    // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
+    // is per-tile coloured, so it can't batch and falls through to per-tile.
+    for (int[] c : gm.conns) appendConn(hexBatch, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
+    hexBatchUsed = true;
+    hexBatchFg   = fg;
+    hexBatchSide = gm.side;
+  } else {
+    boolean doClip = (gm.n != 6);
+    java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.n) : null;
+    drawTileBands(gm.conns, gm.n, gm.vx, gm.vy, gm.mx, gm.my, gm.side, fg);
+    if (doClip) popPolyClip(oldClip);
+  }
+
+  if (winged && gm.n != 6) {
+    noStroke();
+    if (gradientStroke()) {
+      for (int k = 0; k < gm.n; k++) fillDiscG2(gm.mx[k], gm.my[k], gm.side / 6.0);
     } else {
       fill(fg);
-      for (int k = 0; k < n; k++) ellipse(mx[k], my[k], side / 3.0, side / 3.0);
+      for (int k = 0; k < gm.n; k++)
+        ellipse(gm.mx[k], gm.my[k], gm.side / 3.0, gm.side / 3.0);
     }
   }
+}
+
+// ---- drop shadow (pass B) ----------------------------------------
+// All casters of one depth level -- band strokes + fg wing nubs, each tile
+// offset along shadowAngle by shadowSize * its stroke width (side/3) -- are
+// drawn OPAQUE into one offscreen mask, then the mask is composited onto the
+// canvas once at shadowStrength. One mask + one composite means abutting and
+// overlapping shadows merge seamlessly: no double-darkening where casters
+// overlap, and no cuts at tile borders (per-tile clipped shadows read as
+// randomly-angled fragments). Translucent black darkens whatever lies beneath
+// by the same step in every colour scheme, flat or gradient. Level ordering
+// does the rest: the mask lands after the level's backgrounds, beneath its
+// bands, and deeper levels paint their own backgrounds over it.
+BufferedImage shadowLayer;        // reusable canvas-sized mask
+
+Graphics2D beginShadowLayer() {
+  if (shadowLayer == null || shadowLayer.getWidth() != width || shadowLayer.getHeight() != height)
+    shadowLayer = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+  Graphics2D sg = shadowLayer.createGraphics();
+  sg.setComposite(AlphaComposite.Clear);               // wipe the previous level
+  sg.fillRect(0, 0, width, height);
+  sg.setComposite(AlphaComposite.SrcOver);
+  sg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+  sg.setColor(Color.BLACK);
+  return sg;
+}
+
+void addTileShadow(Graphics2D sg, Tile t) {
+  TileGeom gm = new TileGeom(t);
+  float off = shadowSize * gm.side / 3.0;
+  AffineTransform oldT = sg.getTransform();
+  sg.translate(off * cos(shadowAngle), off * sin(shadowAngle));
+  if (gm.conns.length > 0) {
+    Path2D.Float path = new Path2D.Float();
+    for (int[] c : gm.conns) appendConn(path, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
+    int cap = (gm.n == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+    sg.setStroke(new BasicStroke(gm.side / 3.0, cap, BasicStroke.JOIN_ROUND));
+    sg.draw(path);
+  }
+  if (winged && gm.n != 6) {                  // the fg nubs cast shadows too
+    float r = gm.side / 6.0;
+    for (int k = 0; k < gm.n; k++)
+      sg.fill(new Ellipse2D.Float(gm.mx[k] - r, gm.my[k] - r, 2 * r, 2 * r));
+  }
+  sg.setTransform(oldT);
+}
+
+void compositeShadowLayer(Graphics2D sg) {
+  sg.dispose();
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  java.awt.Composite old = g2.getComposite();
+  g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER,
+                                             constrain(shadowStrength, 0, 1)));
+  g2.drawImage(shadowLayer, 0, 0, null);
+  g2.setComposite(old);
+}
+
+// ---- 3D extrusion (graffiti block depth) -------------------------
+// The foreground ribbons gain solid side walls extruded toward a vanishing
+// point, viewed head-on. One depth LEVEL at a time (called from draw() between
+// the all-backgrounds pass and that level's top faces, coarse-first): build the
+// level's foreground silhouette (band path + wing nubs) ONCE, then re-draw it as
+// many overlapping "slices" stepping toward the VP -- OBLIQUE translates each
+// slice in parallel (block); 1-POINT scales each slice about the VP (converging,
+// thinner at the back). Every slice is the SAME flat side colour painted into one
+// ARGB layer, so the stack unions into one clean wall (same-colour-over-same-
+// colour blending leaves no internal seam); the layer is composited once. Drawing
+// the silhouette as vector geometry under an AffineTransform (rather than scaling
+// a raster) keeps the thin side/3 + side/6 features crisp at every depth.
+BufferedImage extrudeLayer;       // reusable canvas-sized body layer
+
+// One flat dark shade of the ribbon colour for every side wall.
+color sideColor() { return lerpColor(palettes.current().darkest(), color(0), constrain(extrudeShade, 0, 1)); }
+float vpScreenX() { return vpX * width; }
+float vpScreenY() { return vpY * height; }
+
+void drawExtrudeLevel(int d) {
+  // collect this level's silhouette: all band subpaths + wing-nub discs. Within a
+  // level every tile is the same size, so one representative side/n/cap applies.
+  Path2D.Float bands = new Path2D.Float();
+  ArrayList<float[]> nubs = new ArrayList<float[]>();   // {cx, cy, r}
+  float repSide = 0; int repN = 4; boolean any = false;
+  for (Tile lf : leaves) {
+    if (lf.depth != d) continue;
+    TileGeom gm = new TileGeom(lf);
+    for (int[] c : gm.conns) appendConn(bands, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
+    if (winged && gm.n != 6) {                  // hex tiles have no nubs
+      float r = gm.side / 6.0;
+      for (int k = 0; k < gm.n; k++) nubs.add(new float[]{ gm.mx[k], gm.my[k], r });
+    }
+    repSide = gm.side; repN = gm.n; any = true;
+  }
+  if (!any) return;
+  float depthPx = extrudeDepth * repSide;       // depth scales with tile size
+  if (depthPx < 0.5) return;
+  int cap = (repN == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+
+  Graphics2D sg = beginExtrudeLayer();          // cleared, AA on, paint = side colour
+  sg.setStroke(new BasicStroke(repSide / 3.0, cap, BasicStroke.JOIN_ROUND));
+  AffineTransform base = sg.getTransform();     // identity
+
+  if (extrudeMode == 0) {                        // OBLIQUE: parallel translate toward the VP
+    float dx = vpScreenX() - width / 2.0, dy = vpScreenY() - height / 2.0;
+    float dl = max(1e-3, sqrt(dx * dx + dy * dy));
+    dx /= dl; dy /= dl;
+    int n = constrain(ceil(depthPx / 0.75), 1, 1200);
+    for (int s = 0; s <= n; s++) {
+      float t = depthPx * s / n;
+      sg.setTransform(base);
+      sg.translate(dx * t, dy * t);
+      stampExtrudeBody(sg, bands, nubs);
+    }
+  } else {                                       // 1-POINT: scale each slice about the VP
+    float vx = vpScreenX(), vy = vpScreenY();
+    float Dc = max(1, dist(width / 2.0, height / 2.0, vx, vy));
+    float rBack = constrain(1 - depthPx / Dc, 0.2, 0.98);   // back face shrinks toward VP
+    float diag = sqrt(width * (float) width + height * (float) height);
+    int n = constrain(ceil((1 - rBack) * (diag + Dc) / 0.75), 1, 1200);
+    for (int s = 0; s <= n; s++) {
+      float ratio = lerp(1, rBack, (float) s / n);
+      AffineTransform at = new AffineTransform(base);
+      at.translate(vx, vy); at.scale(ratio, ratio); at.translate(-vx, -vy);
+      sg.setTransform(at);                       // also scales the stroke -> thinner at back
+      stampExtrudeBody(sg, bands, nubs);
+    }
+  }
+  sg.setTransform(base);
+  compositeExtrudeLayer(sg);
+}
+
+// One depth slice of the body: the level's bands + nubs in the side colour.
+void stampExtrudeBody(Graphics2D sg, Path2D.Float bands, ArrayList<float[]> nubs) {
+  sg.draw(bands);
+  for (float[] nb : nubs)
+    sg.fill(new Ellipse2D.Float(nb[0] - nb[2], nb[1] - nb[2], 2 * nb[2], 2 * nb[2]));
+}
+
+Graphics2D beginExtrudeLayer() {
+  if (extrudeLayer == null || extrudeLayer.getWidth() != width || extrudeLayer.getHeight() != height)
+    extrudeLayer = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+  Graphics2D sg = extrudeLayer.createGraphics();
+  sg.setComposite(AlphaComposite.Clear);
+  sg.fillRect(0, 0, width, height);
+  sg.setComposite(AlphaComposite.SrcOver);       // slices accumulate opaquely
+  sg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+  sg.setColor(awtColor(sideColor()));
+  return sg;
+}
+
+void compositeExtrudeLayer(Graphics2D sg) {
+  sg.dispose();
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  java.awt.Composite old = g2.getComposite();
+  g2.setComposite(AlphaComposite.SrcOver);        // opaque side walls
+  g2.drawImage(extrudeLayer, 0, 0, null);
+  g2.setComposite(old);
 }
 
 // True when bands should be painted with the canvas-wide gradient (scheme 4),

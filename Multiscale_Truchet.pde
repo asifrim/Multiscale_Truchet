@@ -52,7 +52,7 @@
 //
 //  Controls:  SPACE = new pattern  |  4/3/6 = square/triangle/hexagon
 //             P/p = prev/next palette  |  R = rotate palette  |  C = colour
-//             scheme  |  M = mirror symmetry  |  S = save PNG
+//             scheme  |  M = symmetry (pixel mirror / rot 180 / tile mirror)  |  S = save PNG
 // ============================================================
 
 // Edges, clockwise:  0 = N (top), 1 = E (right), 2 = S (bottom), 3 = W (left)
@@ -64,9 +64,25 @@ float   subdivideProb = 0.55;   // chance a cell splits into 4
 int     seedVal       = 1;
 boolean winged        = true;   // Carlson wings (structural connections)
 boolean invertPerLevel= true;   // (duotone scheme) flip colours each scale level
+boolean dropShadow    = true;   // bands + wing nubs cast a drop shadow
+float   shadowAngle   = QUARTER_PI;  // direction the shadow falls (radians, screen coords)
+float   shadowSize    = 0.4;    // shadow offset as a fraction of the band stroke width (side/3)
+float   shadowStrength= 0.3;    // shadow darkness: 0 = invisible, 1 = black
+boolean shadowGlobal  = false;  // false = per-level mask (finer bg occludes coarser shadow);
+                                // true = one full-scene mask (coarse tiles cast across finer)
 int     colorScheme   = 0;      // 0 = duotone, 1 = multi, 2 = gradient (see schemeName)
-int     symmetryMode  = 0;      // 0 = none, 1 = vertical axis, 2 = horizontal axis, 3 = both (see applySymmetry)
-String[] SYMMETRY_NAMES = { "none", "vertical", "horizontal", "quad" };
+int     symmetryMode  = 0;      // 0 = none, 1-3 = pixel mirrors (V/H/both), 4 = rot 180 (tile), 5-7 = tile mirrors (V/H/quad)
+String[] SYMMETRY_NAMES = { "none", "vertical", "horizontal", "quad", "rot 180", "tile mir V", "tile mir H", "tile mir quad" };
+
+// 3D extrusion (graffiti block depth): the foreground ribbons get solid sides
+// extruded toward a vanishing point, viewed head-on. See draw()/drawExtrudeLevel.
+boolean extrude3D     = false;  // master toggle
+int     extrudeMode   = 0;      // 0 = oblique (parallel block), 1 = 1-point (converge to VP)
+String[] EXTRUDE_NAMES = { "oblique", "1-point" };
+float   vpX           = 0.5;    // vanishing point, normalised canvas coords (may be off-canvas)
+float   vpY           = -0.2;   // default just above the top edge
+float   extrudeDepth  = 0.5;    // depth as a fraction of each level's tile side
+float   extrudeShade  = 0.55;   // side-wall darkness: 0 = ribbon colour, 1 = black
 
 // gradient scheme state (recomputed per draw; see setupGradient)
 color   gradSolid;              // the one solid colour (tile background)
@@ -78,6 +94,7 @@ PaletteManager palettes;        // colour source (see Palettes.pde), set in setu
 ControlWindow  controls;        // parameter GUI window (see ControlWindow.pde), set in setup()
 TileWindow     tilesWin;        // per-shape tile-weight editor (see TileWindow.pde), set in setup()
 boolean saveRequested = false;  // set by the control window's Save button, handled in draw()
+String  autosavePath  = null;   // TRUCHET_OUT env var: render once to this file, then exit
 
 // ---- tile alphabet ----------------------------------------------
 // The n=4 instance of Steele's sideConnectionSets: every non-crossing
@@ -103,6 +120,51 @@ void setup() {
   palettes = new PaletteManager();   // built-in COLOURlovers snapshot
   noLoop();
 
+  // Headless one-shot render (for verifying changes from the command line —
+  // never screenshot the window): environment variables select the output file
+  // and optionally override parameters; the first fully drawn frame is saved
+  // to TRUCHET_OUT and the sketch exits. Example:
+  //   TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 processing-java --sketch=... --run
+  autosavePath = System.getenv("TRUCHET_OUT");
+  String envShape  = System.getenv("TRUCHET_SHAPE");   // 0 square, 1 triangle, 2 hexagon
+  if (envShape != null)  shapeMode   = constrain(Integer.parseInt(envShape.trim()), 0, 2);
+  String envScheme = System.getenv("TRUCHET_SCHEME");  // 0..4, see schemeName()
+  if (envScheme != null) colorScheme = constrain(Integer.parseInt(envScheme.trim()), 0, 4);
+  String envSeed   = System.getenv("TRUCHET_SEED");
+  if (envSeed != null)   seedVal     = Integer.parseInt(envSeed.trim());
+  String envSym    = System.getenv("TRUCHET_SYM");     // 0..4, see SYMMETRY_NAMES
+  if (envSym != null)    symmetryMode = constrain(Integer.parseInt(envSym.trim()), 0, SYMMETRY_NAMES.length - 1);
+  String envShadow = System.getenv("TRUCHET_SHADOW");  // 0/1: drop shadow off/on
+  if (envShadow != null) dropShadow  = !envShadow.trim().equals("0");
+  String envShStr  = System.getenv("TRUCHET_SHADOW_STR");  // shadow darkness 0..1
+  if (envShStr != null)  shadowStrength = constrain(Float.parseFloat(envShStr.trim()), 0, 1);
+  String envShGl   = System.getenv("TRUCHET_SHADOW_GLOBAL");  // 0/1: per-level vs full-scene mask
+  if (envShGl != null)   shadowGlobal = !envShGl.trim().equals("0");
+  String envShSz   = System.getenv("TRUCHET_SHADOW_SIZE");  // shadow offset (fraction of stroke)
+  if (envShSz != null)   shadowSize = Float.parseFloat(envShSz.trim());
+  String envInv    = System.getenv("TRUCHET_INVERT");  // 0/1: duotone colour inversion per level
+  if (envInv != null)    invertPerLevel = !envInv.trim().equals("0");
+  String envGrid   = System.getenv("TRUCHET_GRID");    // top-level cells per side
+  if (envGrid != null)   gridN       = constrain(Integer.parseInt(envGrid.trim()), 2, 16);
+  String envDepth  = System.getenv("TRUCHET_DEPTH");   // max subdivisions (0 = single scale)
+  if (envDepth != null)  maxDepth    = constrain(Integer.parseInt(envDepth.trim()), 0, 6);
+  String envEx     = System.getenv("TRUCHET_EXTRUDE");      // 0/1: 3D extrusion off/on
+  if (envEx != null)     extrude3D   = !envEx.trim().equals("0");
+  String envExMode = System.getenv("TRUCHET_EXTRUDE_MODE"); // 0 oblique, 1 one-point
+  if (envExMode != null) extrudeMode = constrain(Integer.parseInt(envExMode.trim()), 0, EXTRUDE_NAMES.length - 1);
+  String envVpx    = System.getenv("TRUCHET_VPX");          // vanishing point x (normalised)
+  if (envVpx != null)    vpX         = Float.parseFloat(envVpx.trim());
+  String envVpy    = System.getenv("TRUCHET_VPY");          // vanishing point y (normalised)
+  if (envVpy != null)    vpY         = Float.parseFloat(envVpy.trim());
+  String envExD    = System.getenv("TRUCHET_EXTRUDE_DEPTH"); // depth (fraction of tile side)
+  if (envExD != null)    extrudeDepth = Float.parseFloat(envExD.trim());
+  String envExS    = System.getenv("TRUCHET_EXTRUDE_SHADE"); // side darkness 0..1
+  if (envExS != null)    extrudeShade = constrain(Float.parseFloat(envExS.trim()), 0, 1);
+  if (autosavePath != null) {
+    saveRequested = false;             // headless writes only TRUCHET_OUT
+    return;                            // no GUI windows in headless mode
+  }
+
   // launch the GUIs as separate PApplet windows. Each holds a reference back
   // here, edits the globals above, and calls redraw() (the viz is noLoop()).
   controls = new ControlWindow(this);
@@ -123,21 +185,91 @@ void draw() {
 
   // 1. build the top-level tiling for the active shape, then subdivide
   //    (square + triangle) collecting leaf tiles. (See Shapes.pde.)
+  //    The tile-level symmetries are structural: rot 180 (mode 4) generates
+  //    only the rows above the rotation centre and adds a half-turn twin per
+  //    leaf; tile mirrors (modes 5-7) generate the fundamental domain (half or
+  //    quadrant) plus the on-axis straddlers (mirror-aware) and add a flipped/
+  //    rotated twin per leaf to fill the rest (see collectSym/addSymTwins).
   leaves = new ArrayList<Tile>();
-  for (Tile t : buildRoots()) collectTile(t);
+  boolean rot180 = (symmetryMode == 4);
+  boolean vMir   = (symmetryMode == 5 || symmetryMode == 7);
+  boolean hMir   = (symmetryMode == 6 || symmetryMode == 7);
+  float rotYc = rot180 ? rotCentreY() : 0;
+  for (Tile t : buildRoots()) {
+    if (rot180 && t.cy >= rotYc) continue;     // half-turn twins fill the rest
+    if (vMir || hMir) { collectSym(t, vMir, hMir); continue; }
+    collectTile(t);
+  }
+  if (rot180)        addRotatedTwins();
+  if (vMir || hMir)  addSymTwins(vMir, hMir);
 
-  // 2. draw coarse-first so finer tiles + wings land on top. Whole hexagons
-  //    (all depth 0) are accumulated by drawPolyTile and stroked once here, as a
-  //    single antialiased shape -- no seams between their overlapping bands.
+  // 2. draw coarse-first so finer tiles + wings land on top. Each depth level
+  //    renders in three passes -- all backgrounds, then ONE unioned shadow
+  //    layer, then all foregrounds (see Shapes.pde) -- so every shadow falls
+  //    across every same-level background yet stays beneath every same-level
+  //    band, keeping a single consistent light direction. Whole hexagons (all
+  //    depth 0) accumulate their bands and are stroked once, as a single
+  //    antialiased shape -- no seams between their overlapping bands.
   hexBatch = new Path2D.Float();
   hexBatchUsed = false;
-  for (int d = 0; d <= maxDepth; d++) {
-    for (Tile lf : leaves)
-      if (lf.depth == d) drawPolyTile(lf, tileFg(lf), tileBg(lf));
-    if (d == 0 && hexBatchUsed) strokeHexBatch();
+  if (extrude3D) {
+    // 3D EXTRUSION: lay down ALL backgrounds first (so a finer tile's background
+    // can never chop a coarser ribbon's wall), then the optional drop shadow on
+    // that flat plane, then per level coarse-first build+composite the extruded
+    // side walls and draw the top faces on top -- finer tiles' walls/tops land
+    // over coarser ones (Carlson's "smaller on top"). See drawExtrudeLevel.
+    for (int d = 0; d <= maxDepth; d++)
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileBackground(lf, tileBg(lf));
+    if (dropShadow) {
+      Graphics2D sg = beginShadowLayer();
+      for (Tile lf : leaves) addTileShadow(sg, lf);
+      compositeShadowLayer(sg);
+    }
+    for (int d = 0; d <= maxDepth; d++) {
+      drawExtrudeLevel(d);
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
+      if (d == 0 && hexBatchUsed) strokeHexBatch();
+    }
+  } else if (dropShadow && shadowGlobal) {
+    // GLOBAL shadow: one full-scene mask. Lay down ALL backgrounds (coarse-first),
+    // composite every caster's shadow once, then ALL foregrounds. Coarse tiles
+    // cast across finer regions because the mask lands after the finer backgrounds.
+    for (int d = 0; d <= maxDepth; d++)
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileBackground(lf, tileBg(lf));
+    Graphics2D sg = beginShadowLayer();
+    for (Tile lf : leaves) addTileShadow(sg, lf);
+    compositeShadowLayer(sg);
+    for (int d = 0; d <= maxDepth; d++) {
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
+      if (d == 0 && hexBatchUsed) strokeHexBatch();
+    }
+  } else {
+    // PER-LEVEL shadow (default): each depth renders bg -> shadow -> fg, so a
+    // finer level's backgrounds occlude the coarser level's shadow beneath it.
+    for (int d = 0; d <= maxDepth; d++) {
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileBackground(lf, tileBg(lf));
+      if (dropShadow) {
+        Graphics2D sg = null;                       // lazy: skip empty levels
+        for (Tile lf : leaves)
+          if (lf.depth == d) {
+            if (sg == null) sg = beginShadowLayer();
+            addTileShadow(sg, lf);
+          }
+        if (sg != null) compositeShadowLayer(sg);
+      }
+      for (Tile lf : leaves)
+        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
+      if (d == 0 && hexBatchUsed) strokeHexBatch();
+    }
   }
 
-  // 3. mirror symmetry: reflect the rendered pattern about grid-aligned axes.
+  // 3. mirror symmetry (modes 1-3): reflect the rendered pixels about
+  //    grid-aligned axes. (Mode 4, rot 180, is tile-level -- see step 1.)
   applySymmetry();
 
   // 4. honour a save request from the control window (run here, on the
@@ -146,6 +278,12 @@ void draw() {
     saveFrame("truchet-####.png");
     saveRequested = false;
   }
+
+  // 5. headless mode (TRUCHET_OUT): save the rendered frame and quit.
+  if (autosavePath != null) {
+    save(autosavePath);
+    exit();
+  }
 }
 
 // Recursively subdivide a tile (per its shape) or record it as a leaf.
@@ -153,6 +291,8 @@ void collectTile(Tile t) {
   if (canSubdivide(t) && random(1) < subdivideProb) {
     for (Tile c : children(t)) collectTile(c);
   } else {
+    t.mi = pickWeighted(weightsFor(t.n));   // fix the motif at collection time so
+    t.mk = int(random(t.n));                // a rot-180 twin can reuse it verbatim
     leaves.add(t);
   }
 }
@@ -212,6 +352,202 @@ void applySymmetry() {
       popMatrix();
     }
   }
+}
+
+// ---- rot-180 symmetry (tile level) -------------------------------
+// 180-degree rotation is structural, not pixel-copied: a half-turn of a tile
+// is just rot + PI with the SAME motif (no edge relabelling -- unlike a mirror
+// image, which is why the mirror modes stay pixel-based). draw() generates
+// only the roots above the rotation centre; addRotatedTwins() then adds a
+// half-turn twin of every leaf. Everything draws in one normal pass, so wings
+// spill across the join in both directions, coarse-first layering holds, the
+// drop shadow keeps a single light direction, and the gradient schemes stay
+// continuous -- there is no pixel seam at all.
+//
+// The centre must be a 2-fold rotation centre of the grid so the twins land
+// exactly back on the grid. Squares/triangles use (width/2, the grid/row line
+// at or past height/2): the twins of cell rows 0..k-1 are exactly rows
+// k..2k-1, an exact cover with no overlap. A hexagon row line cannot work that
+// way (rows would map onto themselves), so hexagons rotate about a slanted-
+// edge midpoint -- x on the odd hexW/4 column, y on the half-row line -- which
+// maps row r to row 2rs+1-r and swaps the stagger parity correctly; rs is
+// chosen so the twins of rows 0..rs cover every row visible below.
+
+float rotCentreX() {
+  if (shapeMode != 2) return width / 2.0;               // a multiple of L/2 for both
+  return width / 2.0 + (float) width / gridN / 4.0;     // hexagon: slant-edge midpoint column
+}
+
+float rotCentreY() {
+  if (shapeMode != 2) {
+    float py = symPitchY();                             // square grid line / triangle row line
+    return py * ceil(height / (2.0 * py) - 1e-4);
+  }
+  float R0 = (float) width / (gridN * sqrt(3));         // matches hexagonRoots()
+  float vSp = 1.5 * R0;
+  int last = ceil((height + R0) / vSp) - 1;             // lowest hex row visible on canvas
+  int rs   = ceil((last - 1) / 2.0);                    // keep rows 0..rs; twins are rows rs+1..2rs+1
+  return (rs + 0.5) * vSp;                              // slant-edge midpoint line
+}
+
+// Append a half-turn twin of every collected leaf (same motif, rot + PI).
+void addRotatedTwins() {
+  float xc = rotCentreX(), yc = rotCentreY();
+  int n0 = leaves.size();
+  for (int i = 0; i < n0; i++) {
+    Tile t = leaves.get(i);
+    Tile twin = new Tile(2 * xc - t.cx, 2 * yc - t.cy, t.R, t.rot + PI, t.n, t.depth);
+    twin.mi = t.mi;
+    twin.mk = t.mk;
+    leaves.add(twin);
+  }
+}
+
+// ---- tile-level mirror symmetry (modes 5-7) -----------------------
+// Structural mirrors, the tile-level siblings of the pixel mirror modes: like
+// rot 180 they render in one normal pass (wings spill both ways, shadows keep
+// one light direction, gradients stay continuous), but each reflected half is
+// the exact REFLECTION of the fundamental one, motif for motif. A mirrored
+// motif is drawn by reversing the tile's vertex winding (Tile.flip, see
+// TileGeom in Shapes.pde), so no per-shape edge-relabelling tables are needed.
+// Modes: 5 = vertical axis only, 6 = horizontal only, 7 = quad (both -> the
+// Klein 4-group {identity, V, H, 180-rotation}).
+//
+// Tile-level twinning needs NO global grid mirror line: the reflected half is
+// self-consistent by construction, so only the SEAM along the axis must be
+// clean -- i.e. the axis may pass along tile edges/vertices (tiles lie fully on
+// one side) or through tile CENTRES ("straddlers", which map to themselves and
+// must look symmetric alone), but never cut a tile body off-centre. The chosen
+// axes satisfy this for every shape:
+//   * vertical x = width/2 -- a mirror column of all three grids (the grid
+//     divides width exactly): squares straddle it for odd gridN, triangles one
+//     per strip, hexes every other row.
+//   * horizontal y = mirrorAxisY() -- snapped to the nearest grid mirror line
+//     to mid-canvas (height is NOT divided evenly, so it sits slightly
+//     off-centre): square cell/boundary line (s0/2 spacing), triangle strip
+//     boundary (row-line spacing; the up-triangle bases there tile edge-to-edge
+//     and their flipped twins share those exact edges -> no straddlers), or
+//     hexagon row-centre line (a straddler row; its fan-triangle children split
+//     into 2 straddlers + 2 mirror pairs).
+// collectSym() walks the fundamental domain straddler-aware; addSymTwins()
+// fills the rest; straddler leaves get a motif symmetric about the relevant
+// axis/axes (pickSymmetricMotifMulti).
+
+float mirrorAxisX() { return width / 2.0; }
+
+// Nearest grid horizontal mirror line to mid-canvas (see header). Square cell
+// lines are s0/2 apart (both boundaries and centres mirror); triangle strip
+// boundaries are rowH apart; hexagon row centres are vSpacing apart.
+float mirrorAxisY() {
+  float L = (float) width / gridN;
+  float u;
+  if (shapeMode == 0)      u = L / 2.0;             // square: s0/2 lines
+  else if (shapeMode == 1) u = L * sqrt(3) / 2.0;   // triangle: rowH strip boundaries
+  else                     u = 1.5 * (float) width / (gridN * sqrt(3));  // hexagon: row centres
+  return round((height / 2.0) / u) * u;
+}
+
+boolean straddleV(Tile t) { return abs(t.cx - mirrorAxisX()) < 1e-3 * t.R; }
+boolean straddleH(Tile t) { return abs(t.cy - mirrorAxisY()) < 1e-3 * t.R; }
+
+// Collect a tile under the active mirror axes. A tile strictly on the far side
+// of an axis is dropped (a twin will cover it); a tile centred on an axis is a
+// straddler (recurse mirror-aware, or emit a leaf with an axis-symmetric
+// motif); anything else lies wholly in the fundamental domain and collects
+// normally (its children stay inside it, since the axis never cuts a body
+// off-centre).
+void collectSym(Tile t, boolean vMir, boolean hMir) {
+  float ax = mirrorAxisX(), ay = mirrorAxisY(), tol = 1e-3 * t.R;
+  if (vMir && t.cx > ax + tol) return;            // right half: V-twins cover it
+  if (hMir && t.cy > ay + tol) return;            // bottom half: H-twins cover it
+  boolean onV = vMir && straddleV(t);
+  boolean onH = hMir && straddleH(t);
+  if (!onV && !onH) { collectTile(t); return; }   // interior of the fundamental domain
+  if (canSubdivide(t) && random(1) < subdivideProb) {
+    for (Tile c : children(t)) collectSym(c, vMir, hMir);
+  } else {
+    pickSymmetricMotifMulti(t, onV, onH);
+    leaves.add(t);
+  }
+}
+
+// Add the symmetry-orbit twins of every fundamental leaf. The orbit (minus the
+// identity) is up to three images; an axis the tile straddles fixes it, so that
+// reflection is skipped (and the diagonal 180-rotation collapses onto the
+// remaining single reflection). V/H reflections reverse winding (flip); the
+// 180-rotation is two reflections, so it does not.
+void addSymTwins(boolean vMir, boolean hMir) {
+  float ax = mirrorAxisX(), ay = mirrorAxisY();
+  int n0 = leaves.size();
+  for (int i = 0; i < n0; i++) {
+    Tile t = leaves.get(i);
+    boolean onV = vMir && straddleV(t);
+    boolean onH = hMir && straddleH(t);
+    if (vMir && !onV)            addTwin(2 * ax - t.cx, t.cy, PI - t.rot, true, t);
+    if (hMir && !onH)            addTwin(t.cx, 2 * ay - t.cy, -t.rot, true, t);
+    if (vMir && hMir && !onV && !onH)
+                                 addTwin(2 * ax - t.cx, 2 * ay - t.cy, t.rot + PI, false, t);
+  }
+}
+
+void addTwin(float cx, float cy, float rot, boolean flip, Tile src) {
+  Tile tw = new Tile(cx, cy, src.R, rot, src.n, src.depth);
+  tw.mi = src.mi;
+  tw.mk = src.mk;
+  tw.flip = flip;
+  leaves.add(tw);
+}
+
+// Constrained motif roll for a straddler: keep only (motif, rotation) pairs
+// symmetric about every axis the tile straddles. A reflection maps the tile's
+// edge e -> c0 - 1 - e; c0 differs per axis -- vertical reflection (theta ->
+// PI - theta) gives c0 = (PI - 2*rot)/(TWO_PI/n), horizontal (theta -> -theta)
+// gives c0 = -2*rot/(TWO_PI/n) -- each an integer because a straddler's
+// footprint is self-symmetric about that axis. Each qualifying pair keeps its
+// natural weight w[mi], so this is the normal roll conditioned on symmetry.
+// Every alphabet has qualifying entries (blank for square/triangle; e.g. the
+// trefoil and asterisk for hexagons); should weights leave none, fall back to
+// motif 0.
+void pickSymmetricMotifMulti(Tile t, boolean onV, boolean onH) {
+  int n = t.n;
+  int[][][] alpha = connsFor(n);
+  float[] w = weightsFor(n);
+  int c0V = ((round((PI - 2 * t.rot) / (TWO_PI / n))) % n + n) % n;
+  int c0H = ((round((-2 * t.rot) / (TWO_PI / n))) % n + n) % n;
+  ArrayList<int[]> cand = new ArrayList<int[]>();
+  float total = 0;
+  for (int mi = 0; mi < alpha.length; mi++)
+    for (int mk = 0; mk < n; mk++) {
+      if (onV && !selfMirrorMotif(alpha[mi], mk, c0V, n)) continue;
+      if (onH && !selfMirrorMotif(alpha[mi], mk, c0H, n)) continue;
+      cand.add(new int[]{ mi, mk });
+      total += w[mi];
+    }
+  if (cand.isEmpty() || total <= 0) { t.mi = 0; t.mk = 0; return; }
+  float r = random(total);
+  int[] pick = cand.get(cand.size() - 1);
+  for (int[] cm : cand) {
+    r -= w[cm[0]];
+    if (r < 0) { pick = cm; break; }
+  }
+  t.mi = pick[0];
+  t.mk = pick[1];
+}
+
+// Does the motif (connection set rotated by mk) map onto itself under the
+// edge reflection e -> c0 - 1 - e?
+boolean selfMirrorMotif(int[][] conns, int mk, int c0, int n) {
+  boolean[][] has = new boolean[n][n];
+  for (int[] c : conns) {
+    int i = (c[0] + mk) % n, j = (c[1] + mk) % n;
+    has[i][j] = has[j][i] = true;
+  }
+  for (int[] c : conns) {
+    int i = ((c0 - 1 - c[0] - mk) % n + n) % n;
+    int j = ((c0 - 1 - c[1] - mk) % n + n) % n;
+    if (!has[i][j]) return false;
+  }
+  return true;
 }
 
 // ---- colour from the active palette -----------------------------
@@ -365,9 +701,17 @@ void keyPressed() {
   } else if (key == 'r' || key == 'R') {   // rotate the palette's colours
     palettes.current().rotate();
     redraw();
-  } else if (key == 'm' || key == 'M') {   // cycle mirror symmetry
-    symmetryMode = (symmetryMode + 1) % 4;
+  } else if (key == 'm' || key == 'M') {   // cycle symmetry (mirrors, then rot 180)
+    symmetryMode = (symmetryMode + 1) % SYMMETRY_NAMES.length;
     println("symmetry: " + SYMMETRY_NAMES[symmetryMode]);
+    redraw();
+  } else if (key == 'e') {                 // toggle 3D extrusion
+    extrude3D = !extrude3D;
+    println("extrude 3D: " + extrude3D);
+    redraw();
+  } else if (key == 'E') {                 // cycle extrusion mode
+    extrudeMode = (extrudeMode + 1) % EXTRUDE_NAMES.length;
+    println("extrude mode: " + EXTRUDE_NAMES[extrudeMode]);
     redraw();
   } else if (key == '4') {                 // square
     setShape(0);
