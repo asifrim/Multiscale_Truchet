@@ -33,11 +33,21 @@ Running opens **three windows**: the visualization, a **Controls** panel, and a
 **Tiles** panel (per-shape archetype weights) — see "Multi-window architecture"
 below. Most parameters are adjustable live from the panels; the keyboard still
 works on the visualization window: **SPACE** = new seed, **4/3/6/t** =
-square/triangle/hexagon/trapezoid, **P/p** = prev/next palette, **R** = rotate palette,
+square/triangle/hexagon/trapezoid, **P/p** = prev/next palette, **R** = rotate palette
+(in duotone, instead assigns two random palette colours to fg/bg — see `rotatePalette`),
 **C** = colour scheme, **M** = symmetry (none/vertical/horizontal/quad/rot 180/
 tile mir V/H/quad), **e** = toggle 3D extrusion, **E** = cycle extrude mode
 (oblique/1-point), **a** = toggle animation, **g** = toggle base-grid overlay,
-**S** = save `truchet-####.png`.
+**l** = toggle line mode (parallel/concentric strokes), **S** = save a
+parameter-stamped PNG.
+
+**Saving** (`saveTiling`, S key or the Controls Save button): the filename encodes
+the displayed parameters + seed (e.g.
+`truchet_trapezoid_duotone_seed4242_g5_d4_sub60_pal12.png`), and the **exact
+headless command that reproduces the frame is printed to the console** (with
+`TRUCHET_SCALE=2` so you can re-render the identical composition at higher
+resolution — every render-affecting global has a matching `TRUCHET_*` override).
+Headless runs (`TRUCHET_OUT`) also echo `name:` + `reproduce:` lines.
 
 **Symmetry** (`symmetryMode`) comes in two mechanisms, deliberately different:
 
@@ -126,6 +136,8 @@ window. Big sizes cost memory (the shadow/extrude `BufferedImage` layers are
 `TRUCHET_SCALE=2 TRUCHET_OUT=/tmp/4k.png processing-java --sketch=… --run`.
 Optional overrides: `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon, 3 trapezoid),
 `TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_PALETTE` (index, wraps),
+`TRUCHET_DUO` (`"bgIdx,fgIdx"` = duotone fg/bg as two palette-colour indices, the
+reproducible form of the duotone "rotate"; omit for the default luminance extremes),
 `TRUCHET_SYM` (0–7),
 `TRUCHET_SHOWGRID` (0/1 = overlay the base root-tile lattice on top of the render;
 re-derived from `buildRoots()` so it covers the whole canvas in every symmetry
@@ -133,14 +145,21 @@ mode — see `drawGridOverlay`), `TRUCHET_GRID`, `TRUCHET_DEPTH` (0 = single sca
 probability 0–1; `1` = uniform finest scale, handy for isolating subdivision
 behaviour from coarse/fine mixing), `TRUCHET_SHADOW` (0/1),
 `TRUCHET_SHADOW_STR` (darkness 0–1), `TRUCHET_SHADOW_SIZE` (offset, fraction of
-the band stroke; unclamped here for exaggerated tests), `TRUCHET_SHADOW_GLOBAL`
-(0 = per-level mask, 1 = one full-scene mask), `TRUCHET_INVERT` (0/1 = duotone
+the band stroke; unclamped here for exaggerated tests), `TRUCHET_SHADOW_ANGLE`
+(shadow direction, degrees), `TRUCHET_SHADOW_GLOBAL`
+(0 = per-level mask, 1 = one full-scene mask), `TRUCHET_WINGED` (0/1 = Carlson
+wings on/off), `TRUCHET_INVERT` (0/1 = duotone
 per-level colour inversion; off makes one hue always foreground — handy when a
 shadow on an inverted-level *background* reads as if the background were
 casting), `TRUCHET_EXTRUDE` (0/1 = 3D extrusion), `TRUCHET_EXTRUDE_MODE`
 (0 oblique, 1 one-point), `TRUCHET_VPX`/`TRUCHET_VPY` (vanishing point,
 normalised canvas coords, may be off-canvas), `TRUCHET_EXTRUDE_DEPTH` (fraction
 of tile side), `TRUCHET_EXTRUDE_SHADE` (side darkness 0–1).
+Line mode (parallel/concentric strokes — see "Line mode" below): `TRUCHET_LINE`
+(0/1), `TRUCHET_LINE_COUNT` (lines across a depth-0 band, sets the global pitch),
+`TRUCHET_LINE_DUTY` (ink fraction of the pitch, 0–1), `TRUCHET_LINE_SUBDIV`
+(0–1 = per-stroke probability of subdividing into the line bundle vs drawing the
+original full-thickness stroke; `1` = all lines, plain line mode).
 Animation (headless verification of motion — the loop never starts in headless;
 these pin a single deterministic frame): `TRUCHET_ANIM_T` (seconds → LFO-driven
 frame at that phase), `TRUCHET_ANIM_RATE` (master LFO Hz), `TRUCHET_ANIM_DEPTH`
@@ -280,6 +299,89 @@ radius — doubling the arcs into a chunky mess on the next shape/frame. This wa
 the actual cause of the "hexagon looks broken after switching shapes" bug (not
 the grid — the hex grid is a correct staggered tessellation).
 
+### Line mode (parallel / concentric strokes)
+
+`lineMode` (key **l**, Controls toggle, `TRUCHET_LINE`) renders each band not as
+one solid stroke of width `side/3` but as a **bundle of thin lines at constant
+perpendicular offset from the centre-line** — the fingerprint/topographic look.
+The mechanism is exact, not faked: a straight band's offset is a parallel
+translate of its endpoints along the edge normal; an arc's offset is a
+**concentric arc** (`radius = r0 + offset`), and since the connection invariant
+puts every band centre-line *perpendicular* to the edge it crosses (the arc
+centre is the intersection of the two edge lines, which lies on each edge line,
+so the radius to the crossing runs *along* the edge), a constant radial offset is
+a constant perpendicular offset. Equal-offset lines of two abutting tiles
+therefore land on the **same points along the shared edge** (`midpoint ± offset`),
+so the bundles flow continuously across tiles at one scale. Cross-scale joins
+(coarse centre-line at the 1/2 point vs. fine ones at 1/4, 3/4) don't line-match;
+the fg wing nub — drawn in line mode as **concentric rings** — bridges them and
+reads as the style's little target/spiral circles. The ring radii are the **same
+offset grid** the band lines use (`lineOffsets(2·fgR)`, positive half), so a ring
+of radius `|offset_k|` passes through that line's edge crossing and — the line
+crossing perpendicular to the edge — is **tangent** to it there; that shared
+grid/phase is what makes the rings and lines align (anchoring the rings to the
+nub radius instead leaves them a half-pitch off).
+
+Pitch is a **constant pixel spacing** = (depth-0 band `bandWidth0`) / `lineCount`,
+computed once in `rebuildLeaves` from `buildRoots()[0]`, so the hatching reads at
+one density across the whole canvas and every export resolution; a band of width
+`w` simply holds `round(w/pitch)` lines (`lineOffsets`), finer tiles fewer. Line
+stroke weight = `pitch · lineDuty` (`lineStroke()`), leaving paper between lines.
+Implemented entirely at render time: `appendConn`/`appendTrapConn`/`appendStraight`
+gained an `offset` param (0 = the original centre-line, so shadow/extrude — which
+call `appendBands` = offset 0 — and the whole off path stay **byte-identical**);
+`drawTileBands`, the hex-batch branch, `strokeHexBatch`, and the wing-disc pass
+each branch on `lineMode`. Lines are stroked `CAP_ROUND`, and line mode **skips
+the polygon clip** (`doClip = (n!=6) && !lineMode`) — the thin strokes stay within
+the band region, and clipping at the tile edge would slice the round caps back to
+flat. The bg corner discs stay solid (the "paper" gaps).
+Works with every colour scheme (gradient included, via `g2` + `gradPaint`) and
+shape; only the depth-0/whole-hexagon band continuity is line-aligned (subdivided
+detail abuts via rings, as above). Globals: `lineMode`/`lineCount`/`lineDuty`/
+`bandWidth0` (main tab).
+
+**Opaque ribbons** (line mode, every scheme except 3 — gradient-bg, whose smooth
+canvas gradient must show through). The line bundle is drawn over an **opaque
+`side/3` ribbon base** in the tile's *background* colour, so a band is not
+transparent: where it runs through a port it covers that port's wing ring (two
+arcs joining no longer show the little circle), and crossing/overlapping bands
+cover cleanly instead of letting the strokes underneath show through (crossings
+read as an over/under weave). A port the band does **not** continue across (an
+unmatched / cross-scale join) keeps its ring's outer half — the arc curls into the
+spiral. Geometry makes this exact: a port ring's radius is `≤ side/6` and the
+band is `side/3` wide, so the ribbon base covers the ring at a through-port and
+the clip drops only the half that spills into a neighbour (a matched neighbour's
+base covers that half too → ring vanishes; an unmatched one leaves the spiral).
+Because the base is opaque it would erase a neighbour's lines at the join, so the
+three steps run **level-wide, not per tile** (`drawForegroundLevel`): pass 1 all
+wing rings, pass 2 all ribbon bases, pass 3 all line bundles — the bundle on top
+across every tile keeps the hatching continuous (`drawTileLineRings`/
+`drawTileRibbonBase`/`drawTileLineBundle`). Whole hexagons (scheme ≠ 2) stay the
+transparent batched layer (nothing problematic sits under the coarse layer).
+Solid mode and scheme 3 keep the original single per-tile `drawTileForeground`
+path.
+
+**Per-stroke subdivision** (`lineSubdivProb`, key-less, Controls "line subdiv"
+slider, `TRUCHET_LINE_SUBDIV`). In line mode each *stroke* (one connection of one
+tile) is independently rendered either as the thin line bundle or as the original
+full-thickness `side/3` stroke; the slider is `P(subdivided)` (`1` = all lines =
+plain line mode, byte-identical; `0` = all full-thickness). The choice is a
+**stable hash** of the tile identity + connection index (`strokeSubdivided`), so
+it holds per seed and updates live when the slider moves — no layout rebuild
+(`dirtyLayout` not set). It lives in pass 3 (`drawTileLineBundle`, which now
+iterates connections one at a time via `TileGeom.appendOneBand` and strokes a
+`solid` path at `side/3` plus a `lines` path at `lineStroke()`); a full-thickness
+stroke is opaque fg so it covers the pass-2 ribbon base and the pass-1 rings under
+it. Whole hexagons split the same way into `hexBatch` (lines) + `hexSolidBatch`
+(full-thickness), both flushed in `strokeHexBatch`. Each port belongs to at most
+one connection, so the wing nub follows its stroke: a full-thickness stroke's
+ports get a **solid disc** nub (like solid mode — it merges into the opaque
+stroke), while subdivided-stroke ports and unused ports keep the concentric rings
+(`solidPorts` / `drawTileLineRings`). (Curved thin strokes are also kept smooth by setting Java2D
+`KEY_STROKE_CONTROL = VALUE_STROKE_PURE` — the default `STROKE_NORMALIZE` snaps
+thin strokes to the pixel grid and visibly jags long arcs; set once per frame on
+the main `g2` and on the shadow/extrude offscreen layers.)
+
 ## Structure of the sketch
 
 The `.pde` tabs are merged into one PApplet:
@@ -392,8 +494,19 @@ The `.pde` tabs are merged into one PApplet:
   projection; schemes 3 and 4 use it via `g2` (`drawGradientBackground` fills the
   canvas; `gradientStroke()`/`drawTileBands`/`fillDiscG2` stroke the bands and wing
   discs). `tileFg`/`tileBg` take the `Tile` (gradient needs position). Keys
-  `p`/`P` palettes, `R` rotate palette colour order (`Palette.rotate`), `C`
-  scheme. There is no `cDark`/`cLight`. The gradient schemes pick via `random()`,
+  `p`/`P` palettes, `R`/Controls "rotate" = `rotatePalette()` (scheme-aware: in
+  **duotone** it picks two random palette colours for fg/bg — `rotateDuotone` sets
+  `duoRandom` + `duoBgIdx`/`duoFgIdx` (bg = the lighter), read by
+  `tileFg`/`tileBg`/`canvasBgColor`, reproduced via `TRUCHET_DUO`. The pair must
+  clear a **minimum luminance gap** (`0.4·` the palette's own range, always
+  achievable) and differ from the current pair, so each press visibly changes.
+  It draws from its **own** `java.util.Random` (`duoRng`), NOT Processing's
+  `random()`: `draw()` reseeds `random()` to `seedVal` every frame (the
+  `dirtyGradient` block), so reusing it picked the identical pair on every press —
+  the original bug. Rotating the colour *order* is invisible in duotone since its
+  extremes are luminance-picked, so for every **other** scheme `R` cycles the
+  colour order via `Palette.rotate`. Selecting another palette clears `duoRandom`
+  back to the luminance extremes), `C` scheme. There is no `cDark`/`cLight`. The gradient schemes pick via `random()`,
   so `draw()` re-seeds (`randomSeed(seedVal)`) after `setupGradient()` to keep the
   tile layout identical across schemes. `loadDefaults()` seeds **45** palettes
   from the COLOURlovers all-time most-loved list (hex verified against two
@@ -503,10 +616,11 @@ Gotchas that matter when editing this:
   (palette name, swatches, current shape/scheme) are best-effort cross-thread —
   fine for a control panel, but don't build logic that assumes atomicity.
 - **Save goes through a flag, not a direct call.** The Save button sets
-  `parent.saveRequested = true` and calls `redraw()`; the actual `saveFrame()`
-  runs at the end of the viz's `draw()` (step 3). This guarantees the saved PNG
-  is the fully-drawn frame and avoids grabbing the pixel buffer from the wrong
-  thread mid-render.
+  `parent.saveRequested = true` and calls `redraw()`; the actual save
+  (`saveTiling()`) runs at the end of the viz's `draw()` (step 4). This guarantees
+  the saved PNG is the fully-drawn frame and avoids grabbing the pixel buffer from
+  the wrong thread mid-render. `saveTiling()` builds the parameter-stamped filename
+  (`saveBaseName()`) and prints the reproduce command (`reproduceCmd()`).
 - **Keep widgets in sync with globals.** `syncParent()` maps sliders/toggles onto
   `parent.gridN/maxDepth/subdivideProb/winged/invertPerLevel` by index/field; the
   shape/scheme/palette buttons call the same mutators the keyboard does. If you

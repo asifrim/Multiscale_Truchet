@@ -53,7 +53,8 @@
 //  Keys 4/3/6/t.
 //
 //  Controls:  SPACE = new pattern  |  4/3/6/t = square/triangle/hexagon/trapezoid
-//             P/p = prev/next palette  |  R = rotate palette  |  C = colour
+//             P/p = prev/next palette  |  R = rotate palette (duotone: 2 random
+//             palette colours for fg/bg)  |  C = colour
 //             scheme  |  M = symmetry (pixel mirror / rot 180 / tile mirror)
 //             g = grid overlay  |  S = save PNG
 // ============================================================
@@ -74,9 +75,34 @@ float   shadowStrength= 0.3;    // shadow darkness: 0 = invisible, 1 = black
 boolean shadowGlobal  = false;  // false = per-level mask (finer bg occludes coarser shadow);
                                 // true = one full-scene mask (coarse tiles cast across finer)
 int     colorScheme   = 0;      // 0 = duotone, 1 = multi, 2 = gradient (see schemeName)
+// Duotone (scheme 0) colours. By default the palette's luminance extremes
+// (lightest = bg, darkest = fg). The palette "rotate" action instead picks two
+// random palette colours, stored as indices (duoRandom = true); selecting another
+// palette resets it. Indices (not colours) so the choice survives reproduce.
+boolean duoRandom     = false;
+int     duoBgIdx, duoFgIdx;
+// Own RNG for the duotone rotate: Processing's random() is reseeded to seedVal
+// every draw() (see the dirtyGradient block), so reusing it would pick the SAME
+// pair on every press. This free-running stream advances each press instead.
+java.util.Random duoRng;
 int     symmetryMode  = 0;      // 0 = none, 1-3 = pixel mirrors (V/H/both), 4 = rot 180 (tile), 5-7 = tile mirrors (V/H/quad)
 String[] SYMMETRY_NAMES = { "none", "vertical", "horizontal", "quad", "rot 180", "tile mir V", "tile mir H", "tile mir quad" };
 boolean showGrid      = false;  // overlay the base (root) tile lattice on top of the render
+
+// Line mode (parallel/concentric strokes): instead of one solid stroke of width
+// side/3, each band is rendered as a bundle of thin lines at constant PERPENDICULAR
+// offset from the centre-line (so straight bands -> parallel lines, arcs ->
+// concentric arcs). Because Truchet centre-lines cross every edge perpendicular to
+// it and meet C1 at the shared edge midpoint, equal-offset lines of abutting tiles
+// land on the exact same points along the edge -> the line bundles flow across
+// tiles (at one scale; cross-scale joins are bridged by the wing-nub rings). Pitch
+// is a constant pixel spacing (derived from the depth-0 band so it's resolution-
+// independent and scale-consistent); finer bands simply hold fewer lines.
+boolean lineMode      = false;  // master toggle (off => byte-identical to solid bands)
+int     lineCount     = 6;      // number of lines across a depth-0 band (sets the global pitch)
+float   lineDuty      = 0.45;   // ink fraction of the pitch (line stroke weight = pitch * duty)
+float   lineSubdivProb = 1.0;   // P(a stroke is subdivided into the line bundle) vs drawn full-thickness; 1 = all lines
+float   bandWidth0    = 0;      // depth-0 band width (side/3 of a root tile); set in rebuildLeaves
 
 // 3D extrusion (graffiti block depth): the foreground ribbons get solid sides
 // extruded toward a vanishing point, viewed head-on. See draw()/drawExtrudeLevel.
@@ -185,6 +211,15 @@ void setup() {
   if (envSeed != null)   seedVal     = Integer.parseInt(envSeed.trim());
   String envPal    = System.getenv("TRUCHET_PALETTE"); // palette index (wraps; see loadDefaults)
   if (envPal != null)    palettes.setCurrent(Integer.parseInt(envPal.trim()));
+  String envDuo    = System.getenv("TRUCHET_DUO");     // "bgIdx,fgIdx": duotone fg/bg as two palette colours (= rotate)
+  if (envDuo != null) {
+    String[] ix = split(envDuo.trim(), ',');
+    if (ix.length == 2) {
+      duoBgIdx = Integer.parseInt(ix[0].trim());
+      duoFgIdx = Integer.parseInt(ix[1].trim());
+      duoRandom = true;
+    }
+  }
   String envSym    = System.getenv("TRUCHET_SYM");     // 0..4, see SYMMETRY_NAMES
   if (envSym != null)    symmetryMode = constrain(Integer.parseInt(envSym.trim()), 0, SYMMETRY_NAMES.length - 1);
   String envSG     = System.getenv("TRUCHET_SHOWGRID");  // 0/1: overlay the base tile grid
@@ -197,8 +232,20 @@ void setup() {
   if (envShGl != null)   shadowGlobal = !envShGl.trim().equals("0");
   String envShSz   = System.getenv("TRUCHET_SHADOW_SIZE");  // shadow offset (fraction of stroke)
   if (envShSz != null)   shadowSize = Float.parseFloat(envShSz.trim());
+  String envShAng  = System.getenv("TRUCHET_SHADOW_ANGLE"); // shadow direction (degrees)
+  if (envShAng != null)  shadowAngle = radians(Float.parseFloat(envShAng.trim()));
+  String envWing   = System.getenv("TRUCHET_WINGED");  // 0/1: Carlson wings (structural connections)
+  if (envWing != null)   winged      = !envWing.trim().equals("0");
   String envInv    = System.getenv("TRUCHET_INVERT");  // 0/1: duotone colour inversion per level
   if (envInv != null)    invertPerLevel = !envInv.trim().equals("0");
+  String envLine   = System.getenv("TRUCHET_LINE");        // 0/1: parallel-stroke (line) mode
+  if (envLine != null)   lineMode    = !envLine.trim().equals("0");
+  String envLineN  = System.getenv("TRUCHET_LINE_COUNT");  // lines across a depth-0 band
+  if (envLineN != null)  lineCount   = constrain(Integer.parseInt(envLineN.trim()), 1, 40);
+  String envLineD  = System.getenv("TRUCHET_LINE_DUTY");   // ink fraction of the pitch (0..1)
+  if (envLineD != null)  lineDuty    = constrain(Float.parseFloat(envLineD.trim()), 0.05, 0.95);
+  String envLineS  = System.getenv("TRUCHET_LINE_SUBDIV"); // P(stroke subdivided into lines) vs full thickness
+  if (envLineS != null)  lineSubdivProb = constrain(Float.parseFloat(envLineS.trim()), 0.0, 1.0);
   String envGrid   = System.getenv("TRUCHET_GRID");    // top-level cells per side
   if (envGrid != null)   gridN       = constrain(Integer.parseInt(envGrid.trim()), 2, 16);
   String envDepth  = System.getenv("TRUCHET_DEPTH");   // max subdivisions (0 = single scale)
@@ -280,6 +327,13 @@ void draw() {
   // pushPolyClip in Shapes.pde) before we clear and redraw the canvas.
   ((PGraphicsJava2D) g).g2.setClip(null);
 
+  // Geometrically pure stroking. Java2D defaults to STROKE_NORMALIZE, which snaps
+  // thin strokes to the pixel grid -- on long thin curved strokes (line mode's
+  // concentric arcs) that snapping wobbles the path and reads as jagged. PURE
+  // stroking keeps the curve faithful so it antialiases smoothly.
+  ((PGraphicsJava2D) g).g2.setRenderingHint(
+    RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
+
   // IMAGE MODE (TRUCHET_IMG / Controls): render the active image as a mosaic of
   // multi-scale Truchet patches chosen by brightness. Self-contained -- it clears
   // the canvas, builds its own leaves and draws them (see ImageMode.pde) -- so it
@@ -307,13 +361,17 @@ void draw() {
   // 4. honour a save request from the control window (run here, on the
   // viz thread, so the saved frame is the fully drawn one).
   if (saveRequested) {
-    saveFrame("truchet-####.png");
+    saveTiling();
     saveRequested = false;
   }
 
-  // 5. headless mode (TRUCHET_OUT): save the rendered frame and quit.
+  // 5. headless mode (TRUCHET_OUT): save the rendered frame and quit. Also echo the
+  // parameter-stamped name + reproduce command for this frame (handy for scripting
+  // and for confirming the GUI's filename scheme).
   if (autosavePath != null) {
     save(autosavePath);
+    println("name: " + saveBaseName());
+    println("reproduce: " + reproduceCmd(saveBaseName()));
     exit();
   }
 }
@@ -328,6 +386,7 @@ void draw() {
 // it for both the calibration rounds and the final mosaic.
 void renderTiling() {
   hexBatch = new Path2D.Float();
+  hexSolidBatch = new Path2D.Float();
   hexBatchUsed = false;
   if (extrude3D) {
     // 3D EXTRUSION: lay down ALL backgrounds first (so a finer tile's background
@@ -345,9 +404,7 @@ void renderTiling() {
     }
     for (int d = 0; d <= maxDepth; d++) {
       drawExtrudeLevel(d);
-      for (Tile lf : leaves)
-        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
-      if (d == 0 && hexBatchUsed) strokeHexBatch();
+      drawForegroundLevel(d);
     }
   } else if (dropShadow && shadowGlobal) {
     // GLOBAL shadow: one full-scene mask. Lay down ALL backgrounds (coarse-first),
@@ -359,11 +416,7 @@ void renderTiling() {
     Graphics2D sg = beginShadowLayer();
     for (Tile lf : leaves) addTileShadow(sg, lf);
     compositeShadowLayer(sg);
-    for (int d = 0; d <= maxDepth; d++) {
-      for (Tile lf : leaves)
-        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
-      if (d == 0 && hexBatchUsed) strokeHexBatch();
-    }
+    for (int d = 0; d <= maxDepth; d++) drawForegroundLevel(d);
   } else {
     // PER-LEVEL shadow (default): each depth renders bg -> shadow -> fg, so a
     // finer level's backgrounds occlude the coarser level's shadow beneath it.
@@ -379,11 +432,34 @@ void renderTiling() {
           }
         if (sg != null) compositeShadowLayer(sg);
       }
-      for (Tile lf : leaves)
-        if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
-      if (d == 0 && hexBatchUsed) strokeHexBatch();
+      drawForegroundLevel(d);
     }
   }
+}
+
+// Draw all foreground (bands + wings) of one depth level, then flush the depth-0
+// whole-hexagon batch. In line mode (except the smooth gradient-bg scheme, whose
+// background must show through) bands render as OPAQUE ribbons via three
+// level-wide passes:
+//   1. wing rings        -- the little target/spiral circles at the ports;
+//   2. opaque ribbon base (background colour, the full side/3 band) drawn OVER the
+//      rings -- where a band runs through a port it hides that port's ring, so two
+//      arcs joining no longer show the circle and crossing/overlapping bands cover
+//      cleanly instead of letting the lines underneath show through. At a port the
+//      band does NOT continue across (an unmatched / cross-scale join) the ring's
+//      outer half survives -> the arc curls smoothly into the spiral;
+//   3. the foreground line bundle, drawn LAST across ALL tiles so the hatching
+//      stays continuous where neighbouring tiles meet.
+// Solid mode and scheme 3 keep the original single per-tile path.
+void drawForegroundLevel(int d) {
+  if (lineMode && colorScheme != 3) {
+    for (Tile lf : leaves) if (lf.depth == d) drawTileLineRings(lf, tileFg(lf));
+    for (Tile lf : leaves) if (lf.depth == d) drawTileRibbonBase(lf, tileBg(lf));
+    for (Tile lf : leaves) if (lf.depth == d) drawTileLineBundle(lf, tileFg(lf));
+  } else {
+    for (Tile lf : leaves) if (lf.depth == d) drawTileForeground(lf, tileFg(lf));
+  }
+  if (d == 0 && hexBatchUsed) strokeHexBatch();
 }
 
 // Overlay the base (root-level) tile lattice on top of the finished render -- a
@@ -417,8 +493,26 @@ void drawGridOverlay() {
 // (modes 5-7) generate the fundamental domain (half or quadrant) plus the on-axis
 // straddlers (mirror-aware) and add a flipped/rotated twin per leaf to fill the
 // rest (see collectSym/addSymTwins).
+// Constant line pitch (px) for line mode: the depth-0 band split into lineCount
+// lines, applied at every scale (so the hatching reads at one density). Falls back
+// to a sane default before the first layout build. lineStroke() is the per-line
+// stroke weight (a fraction of the pitch, leaving paper between lines).
+float linePitch()  { return (bandWidth0 > 0 ? bandWidth0 : 18) / max(1, lineCount); }
+float lineStroke() { return max(0.5, linePitch() * constrain(lineDuty, 0.05, 0.95)); }
+// Perpendicular offsets of the lines filling a band of width w, centred on the
+// centre-line (symmetric, spaced by the global pitch). max(1,...) => >=1 line.
+float[] lineOffsets(float w) {
+  int nL = max(1, round(w / linePitch()));
+  float[] off = new float[nL];
+  for (int i = 0; i < nL; i++) off[i] = (i - (nL - 1) / 2.0) * linePitch();
+  return off;
+}
+
 void rebuildLeaves() {
   randomSeed(seedVal);             // reseed so motif rolls match the seed exactly
+  // depth-0 band width (side/3 of a root tile) -> the line-mode pitch reference.
+  ArrayList<Tile> roots0 = buildRoots();
+  bandWidth0 = roots0.isEmpty() ? 0 : new TileGeom(roots0.get(0)).side / 3.0;
   leaves = new ArrayList<Tile>();
   // The structural (tile-level) symmetry modes 4-7 rely on grid-specific
   // rotation centres / mirror lines defined only for square/triangle/hexagon, so
@@ -428,7 +522,7 @@ void rebuildLeaves() {
   boolean vMir   = (symmetryMode == 5 || symmetryMode == 7) && shapeMode != 3;
   boolean hMir   = (symmetryMode == 6 || symmetryMode == 7) && shapeMode != 3;
   float rotYc = rot180 ? rotCentreY() : 0;
-  for (Tile t : buildRoots()) {
+  for (Tile t : roots0) {
     if (rot180 && t.cy >= rotYc) continue;     // half-turn twins fill the rest
     if (vMir || hMir) { collectSym(t, vMir, hMir); continue; }
     collectTile(t);
@@ -705,6 +799,48 @@ boolean selfMirrorMotif(int[][] conns, int mk, int c0, int n) {
 }
 
 // ---- colour from the active palette -----------------------------
+// The palette "rotate" control (R key / Controls button). Scheme-aware: in
+// duotone it assigns two random palette colours to fg/bg (rotating the colour
+// order is invisible there, since the extremes are luminance-picked); every other
+// scheme cycles the colour order, which DOES change order-sensitive mappings.
+void rotatePalette() {
+  if (colorScheme == 0) rotateDuotone();
+  else                  palettes.current().rotate();
+  dirtyGradient = true;
+  imgDirty = true;
+}
+
+// Pick two random palette colours for the duotone fg/bg, with a minimum
+// luminance gap (so the pair always reads as a clear fg vs bg) and different from
+// the current pair (so every press visibly changes). bg = the lighter colour, fg
+// = the darker (per-level inversion still swaps them). Uses its own RNG (duoRng).
+void rotateDuotone() {
+  Palette p = palettes.current();
+  int n = p.size();
+  if (n < 2) { duoRandom = false; return; }
+  if (duoRng == null) duoRng = new java.util.Random();
+  // palette luminance range -> a gap that is always achievable (the extremes meet it)
+  float lo = 1e9, hi = -1e9;
+  for (int k = 0; k < n; k++) { float l = p.lum(p.get(k)); lo = min(lo, l); hi = max(hi, l); }
+  float minGap = 0.4 * (hi - lo);
+  int curA = duoRandom ? min(duoBgIdx, duoFgIdx) : -1;
+  int curB = duoRandom ? max(duoBgIdx, duoFgIdx) : -1;
+  int chA = 0, chB = 1; float bestGap = -1;
+  for (int t = 0; t < 64; t++) {
+    int i = duoRng.nextInt(n);
+    int j = duoRng.nextInt(n - 1); if (j >= i) j++;     // distinct from i
+    int a = min(i, j), b = max(i, j);
+    if (a == curA && b == curB) continue;                // same pair as now -> keep trying
+    float gap = abs(p.lum(p.get(a)) - p.lum(p.get(b)));
+    if (gap > bestGap) { bestGap = gap; chA = a; chB = b; }   // track best as a fallback
+    if (gap >= minGap) break;                            // good enough -> take it
+  }
+  boolean aLighter = p.lum(p.get(chA)) >= p.lum(p.get(chB));
+  duoBgIdx = aLighter ? chA : chB;
+  duoFgIdx = aLighter ? chB : chA;
+  duoRandom = true;
+}
+
 String schemeName(int s) {
   switch (s) {
     case 0:  return "duotone";
@@ -721,8 +857,10 @@ color tileBg(Tile t) {
   if (colorScheme == 2 || colorScheme == 4) return gradSolid;   // gradient ribbons: solid ground
   if (colorScheme == 3) return gradientColor(t.cx, t.cy);       // gradient-bg: blend wing corner discs
   if (colorScheme == 1) return p.lightest();                    // multi: constant light ground
-  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: palette extremes
-  return inv ? p.darkest() : p.lightest();
+  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: extremes, or 2 random (rotate)
+  color a = duoRandom ? p.get(duoBgIdx) : p.lightest();         // bg slot when not inverted
+  color b = duoRandom ? p.get(duoFgIdx) : p.darkest();          // fg slot when not inverted
+  return inv ? b : a;
 }
 
 // Foreground (band/wing) colour. (In gradient-smooth the bands are painted via
@@ -732,13 +870,17 @@ color tileFg(Tile t) {
   if (colorScheme == 2 || colorScheme == 4) return gradientColor(t.cx, t.cy);  // gradient ribbons
   if (colorScheme == 3) return gradSolid;                       // gradient-bg: solid ribbons
   if (colorScheme == 1) return ribbonColor(p, t.depth);         // multi: a palette colour per level
-  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: palette extremes
-  return inv ? p.lightest() : p.darkest();
+  boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: extremes, or 2 random (rotate)
+  color a = duoRandom ? p.get(duoBgIdx) : p.lightest();         // bg slot when not inverted
+  color b = duoRandom ? p.get(duoFgIdx) : p.darkest();          // fg slot when not inverted
+  return inv ? a : b;
 }
 
-// Canvas clear colour (shows in overscan / tiny gaps).
+// Canvas clear colour (shows in overscan / tiny gaps). Matches the depth-0 bg.
 color canvasBgColor() {
-  return (colorScheme == 2 || colorScheme == 4) ? gradSolid : palettes.current().lightest();
+  if (colorScheme == 2 || colorScheme == 4) return gradSolid;
+  if (colorScheme == 0 && duoRandom)        return palettes.current().get(duoBgIdx);
+  return palettes.current().lightest();
 }
 
 // Gradient schemes (2 and 3): one palette colour (chosen at random) is the solid
@@ -833,6 +975,100 @@ color ribbonColor(Palette p, int depth) {
   return pool.get(depth % pool.size());
 }
 
+// ---- saving (parameter-stamped) ---------------------------------
+// Save the current frame to a filename that encodes the displayed parameters +
+// seed, and print the exact headless command that reproduces it -- so a saved
+// PNG can later be re-rendered at higher resolution (bump TRUCHET_SCALE) with the
+// identical composition. Called on the viz thread (Save button via saveRequested,
+// or the S key) so the grabbed frame is fully drawn.
+void saveTiling() {
+  String base = saveBaseName();
+  saveFrame(base + ".png");                 // written to the sketch folder
+  println("saved " + base + ".png");
+  println("reproduce at higher resolution (raise/lower TRUCHET_SCALE for the size):");
+  println("  " + reproduceCmd(base));
+}
+
+// Compact, human-readable parameter summary for the filename. Captures the knobs
+// that define the composition; the full recipe (every knob) is in reproduceCmd().
+String saveBaseName() {
+  String s;
+  if (imageMode) {
+    s = "truchet_halftone_" + schemeName(colorScheme)
+      + "_cols" + imgCols + "_pal" + palettes.current;
+    if (imagePath != null) {
+      String b = new java.io.File(imagePath).getName();
+      int dot = b.lastIndexOf('.');
+      if (dot > 0) b = b.substring(0, dot);
+      s += "_" + b.replaceAll("[^A-Za-z0-9._-]", "");
+    }
+    return s;
+  }
+  s = "truchet_" + SHAPE_NAMES[shapeMode] + "_" + schemeName(colorScheme)
+    + "_seed" + seedVal + "_g" + gridN + "_d" + maxDepth
+    + "_sub" + round(subdivideProb * 100) + "_pal" + palettes.current;
+  if (symmetryMode != 0) s += "_sym" + symmetryMode;
+  if (!winged)           s += "_nowing";
+  if (!dropShadow)       s += "_noshadow";
+  else if (shadowGlobal) s += "_gshadow";
+  if (!invertPerLevel)   s += "_noinv";
+  if (extrude3D)         s += "_ext" + extrudeMode;
+  if (lineMode)          s += "_line" + lineCount;
+  return s;
+}
+
+// The full headless command that reproduces this frame. Defaults TRUCHET_SCALE=2
+// (a 4K render); change it for other sizes. Output goes to <base>_hires.png so it
+// doesn't clobber the GUI save. Includes every render-affecting parameter (each
+// has a matching env override parsed in setup()).
+String reproduceCmd(String base) {
+  String cmd = "TRUCHET_SCALE=2"
+    + " TRUCHET_SHAPE="  + shapeMode
+    + " TRUCHET_SCHEME=" + colorScheme
+    + " TRUCHET_PALETTE=" + palettes.current
+    + " TRUCHET_INVERT=" + (invertPerLevel ? 1 : 0)
+    + " TRUCHET_LINE=" + (lineMode ? 1 : 0)
+    + " TRUCHET_LINE_COUNT=" + lineCount
+    + " TRUCHET_LINE_DUTY=" + nf(lineDuty, 1, 2)
+    + " TRUCHET_LINE_SUBDIV=" + nf(lineSubdivProb, 1, 2)
+    + (duoRandom ? " TRUCHET_DUO=" + duoBgIdx + "," + duoFgIdx : "");
+  if (imageMode && imagePath != null) {
+    cmd += " TRUCHET_IMG=" + imagePath
+      + " TRUCHET_IMG_COLS=" + imgCols
+      + " TRUCHET_IMG_LIB=" + libSize
+      + " TRUCHET_IMG_GAMMA=" + nf(imgGamma, 1, 2)
+      + " TRUCHET_IMG_STRETCH=" + (imgStretch ? 1 : 0)
+      + " TRUCHET_IMG_INVERT=" + (imgInvert ? 1 : 0)
+      + " TRUCHET_IMG_CONTAIN=" + (imgContain ? 1 : 0)
+      + " TRUCHET_DEPTH=" + maxDepth
+      + " TRUCHET_SUBDIV=" + nf(subdivideProb, 1, 2)
+      + " TRUCHET_WINGED=" + (winged ? 1 : 0);
+  } else {
+    cmd += " TRUCHET_SEED="  + seedVal
+      + " TRUCHET_GRID="   + gridN
+      + " TRUCHET_DEPTH="  + maxDepth
+      + " TRUCHET_SUBDIV=" + nf(subdivideProb, 1, 2)
+      + " TRUCHET_SYM="    + symmetryMode
+      + " TRUCHET_WINGED=" + (winged ? 1 : 0)
+      + " TRUCHET_SHADOW=" + (dropShadow ? 1 : 0)
+      + " TRUCHET_SHADOW_STR="    + nf(shadowStrength, 1, 2)
+      + " TRUCHET_SHADOW_SIZE="   + nf(shadowSize, 1, 2)
+      + " TRUCHET_SHADOW_ANGLE="  + nf(degrees(shadowAngle), 1, 1)
+      + " TRUCHET_SHADOW_GLOBAL=" + (shadowGlobal ? 1 : 0);
+    if (extrude3D) {
+      cmd += " TRUCHET_EXTRUDE=1"
+        + " TRUCHET_EXTRUDE_MODE="  + extrudeMode
+        + " TRUCHET_VPX=" + nf(vpX, 1, 3)
+        + " TRUCHET_VPY=" + nf(vpY, 1, 3)
+        + " TRUCHET_EXTRUDE_DEPTH=" + nf(extrudeDepth, 1, 2)
+        + " TRUCHET_EXTRUDE_SHADE=" + nf(extrudeShade, 1, 2);
+    }
+  }
+  cmd += " TRUCHET_OUT=" + base + "_hires.png"
+    + " processing-java --sketch=" + sketchPath("") + " --run";
+  return cmd;
+}
+
 // ---- interaction ------------------------------------------------
 void keyPressed() {
   if (key == ' ') {
@@ -840,17 +1076,19 @@ void keyPressed() {
     dirtyLayout = true; dirtyGradient = true;
     redraw();
   } else if (key == 's' || key == 'S') {
-    saveFrame("truchet-####.png");
+    saveTiling();
   } else if (key == 'a' || key == 'A') {   // toggle animation
     setAnimEnabled(!animEnabled);
     println("animation: " + animEnabled);
   } else if (key == 'p') {                 // next palette
     palettes.next();
+    duoRandom = false;                     // new palette -> back to duotone extremes
     println("palette: " + palettes.current());
     dirtyGradient = true;
     redraw();
   } else if (key == 'P') {                 // previous palette
     palettes.prev();
+    duoRandom = false;
     println("palette: " + palettes.current());
     dirtyGradient = true;
     redraw();
@@ -859,9 +1097,8 @@ void keyPressed() {
     println("colour scheme: " + schemeName(colorScheme));
     dirtyGradient = true;
     redraw();
-  } else if (key == 'r' || key == 'R') {   // rotate the palette's colours
-    palettes.current().rotate();
-    dirtyGradient = true;
+  } else if (key == 'r' || key == 'R') {   // rotate: 2 random duotone colours, else cycle order
+    rotatePalette();
     redraw();
   } else if (key == 'm' || key == 'M') {   // cycle symmetry (mirrors, then rot 180)
     symmetryMode = (symmetryMode + 1) % SYMMETRY_NAMES.length;
@@ -887,6 +1124,10 @@ void keyPressed() {
   } else if (key == 'g' || key == 'G') {   // toggle base-grid overlay
     showGrid = !showGrid;
     println("grid overlay: " + showGrid);
+    redraw();
+  } else if (key == 'l' || key == 'L') {   // toggle parallel-stroke (line) mode
+    lineMode = !lineMode;
+    println("line mode: " + lineMode);
     redraw();
   }
 }

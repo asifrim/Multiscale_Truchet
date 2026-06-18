@@ -30,7 +30,10 @@ Two extra windows open alongside the visualization:
 - **R** — rotate the current palette's colour order
 - **C** — cycle colour scheme (duotone → multi → gradient → gradient-bg → gradient-smooth)
 - **g** — toggle the base-grid overlay (outlines the root tiles on top of the pattern)
-- **S** — save the current frame as `truchet-####.png`
+- **S** — save the current frame as a **parameter-stamped PNG** (the filename
+  encodes shape/scheme/seed/grid/depth/etc.), and print the exact headless command
+  that reproduces it — bump `TRUCHET_SCALE` in that command to re-render the same
+  composition at higher resolution
 
 ## How it works
 

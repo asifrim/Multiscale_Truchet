@@ -46,6 +46,7 @@ int[]    SHAPE_N     = { 4, 3, 6, 4 };     // [3] is nominal; trapezoid uses Til
 // are accumulated into ONE path and stroked once -- a single antialiased shape
 // with no 1px seams where overlapping bands of separate tiles would otherwise meet.
 Path2D.Float hexBatch;
+Path2D.Float hexSolidBatch;     // line mode: whole-hex strokes that opted out of subdivision
 boolean hexBatchUsed;
 color   hexBatchFg;
 float   hexBatchSide;
@@ -418,20 +419,37 @@ class TileGeom {
   // Append every connection's centre-line to `path` as a subpath. Regular tiles
   // use the edge-pair construction (appendConn); trapezoids use their explicit
   // arc specs (appendTrapConn). Stroked at width side/3 by the caller.
-  void appendBands(Path2D.Float path) {
+  void appendBands(Path2D.Float path) { appendBandsOffset(path, 0); }
+
+  // Append every connection's centre-line, displaced by a constant PERPENDICULAR
+  // `offset` (px) -- offset 0 is the centre-line (the solid-band path); line mode
+  // calls this once per line in the bundle (see lineOffsets / drawTileBands).
+  void appendBandsOffset(Path2D.Float path, float offset) {
     if (trap) {
-      for (int[] cn : conns) appendTrapConn(path, cn[0], cn[1]);
+      for (int[] cn : conns) appendTrapConn(path, cn[0], cn[1], offset);
     } else {
-      for (int[] cn : conns) appendConn(path, cn[0], cn[1], n, vx, vy, mx, my);
+      for (int[] cn : conns) appendConn(path, cn[0], cn[1], n, vx, vy, mx, my, offset);
     }
+  }
+
+  // Append a SINGLE connection's centre-line (displaced by `offset`) -- line mode
+  // decides per stroke whether to subdivide it into a bundle or draw it full
+  // thickness (see drawTileLineBundle / lineSubdivProb), so it appends one at a time.
+  void appendOneBand(Path2D.Float path, int ci, float offset) {
+    int[] cn = conns[ci];
+    if (trap) appendTrapConn(path, cn[0], cn[1], offset);
+    else      appendConn(path, cn[0], cn[1], n, vx, vy, mx, my, offset);
   }
 
   // One trapezoid connection: a circular arc (in canonical coords) sampled into a
   // screen-space polyline. animArcRadius/animArcSweep modulate it exactly as
   // appendConn does for regular tiles (both 1.0 when animation is off).
-  void appendTrapConn(Path2D.Float path, int a, int b) {
+  void appendTrapConn(Path2D.Float path, int a, int b, float offset) {
     float[] sp = trapArcSpec(a, b);
-    float r  = sp[2] * animArcRadius;
+    // radial offset in canonical units (screen radius = r*side, so px offset/side);
+    // a centre on both ports' edge lines makes this a constant perpendicular offset.
+    float r  = sp[2] * animArcRadius + offset / max(1e-3, side);
+    if (r < 1e-3) r = 1e-3;
     float a0 = radians(sp[3]);
     float diff = (radians(sp[4]) - a0) * animArcSweep;
     int seg = max(8, ceil(r * side * abs(diff) / 3.0));   // r*side = screen arc radius
@@ -491,28 +509,185 @@ void drawTileForeground(Tile t, color fg) {
     // whole hexagons (uniform colour): defer the bands into the shared batch
     // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
     // is per-tile coloured, so it can't batch and falls through to per-tile.
-    gm.appendBands(hexBatch);
+    if (lineMode)
+      for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendBandsOffset(hexBatch, off);
+    else
+      gm.appendBands(hexBatch);
     hexBatchUsed = true;
     hexBatchFg   = fg;
     hexBatchSide = gm.side;
   } else {
-    boolean doClip = (gm.n != 6);
+    // Line mode skips the polygon clip: the thin lines stay within the band
+    // region anyway, and clipping at the tile edge would slice the round caps
+    // back to flat. (Solid bands keep the clip as a safety net for wide arcs.)
+    boolean doClip = (gm.n != 6) && !lineMode;
     java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
     drawTileBands(gm, fg);
     if (doClip) popPolyClip(oldClip);
   }
 
   if (gm.wings) {
-    noStroke();
-    if (gradientStroke()) {
-      for (int k = 0; k < gm.fgWx.length; k++) fillDiscG2(gm.fgWx[k], gm.fgWy[k], gm.side / 6.0 * animDiscScale);
-    } else {
-      fill(fg);
-      float fgD = gm.side / 3.0 * animDiscScale;       // diameter (radius side/6 * anim)
+    float fgR = gm.side / 6.0 * animDiscScale;          // fg nub radius
+    if (lineMode) {
+      // concentric rings at the connection points -> the little target/spiral
+      // circles of the parallel-line style. The radii are the SAME offset grid
+      // the band lines use (the nub caps a band of width 2*fgR), so a ring of
+      // radius |offset_k| passes through that line's edge crossing and -- the line
+      // crossing perpendicular to the edge -- is tangent to it there. That shared
+      // grid/phase is what makes the rings and lines line up.
+      Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+      g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_BUTT, BasicStroke.JOIN_ROUND));
+      g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+      float minR = linePitch() * 0.25;          // skip the ~0 (centre-line) ring
       for (int k = 0; k < gm.fgWx.length; k++)
-        ellipse(gm.fgWx[k], gm.fgWy[k], fgD, fgD);
+        for (float off : lineOffsets(2 * fgR)) {
+          if (off <= minR) continue;             // positive half only
+          float d = 2 * off;
+          g2.draw(new Ellipse2D.Float(gm.fgWx[k] - off, gm.fgWy[k] - off, d, d));
+        }
+    } else {
+      noStroke();
+      if (gradientStroke()) {
+        for (int k = 0; k < gm.fgWx.length; k++) fillDiscG2(gm.fgWx[k], gm.fgWy[k], fgR);
+      } else {
+        fill(fg);
+        float fgD = gm.side / 3.0 * animDiscScale;       // diameter (radius side/6 * anim)
+        for (int k = 0; k < gm.fgWx.length; k++)
+          ellipse(gm.fgWx[k], gm.fgWy[k], fgD, fgD);
+      }
     }
   }
+}
+
+// ---- line-mode opaque-ribbon passes ------------------------------
+// These split drawTileForeground's line-mode work into three level-wide passes
+// (see drawForegroundLevel) so each band reads as an opaque ribbon: rings first,
+// an opaque background-coloured ribbon base over them, then the fg line bundle
+// last (across all tiles, for continuous hatching). Hexagons (the whole-hex
+// coarse layer, scheme != 2) stay transparent and batched, exactly as before.
+
+// Pass 1: the wing nubs at the ports. A port that is an endpoint of a
+// full-thickness (solid) stroke gets a SOLID disc (radius side/6), exactly like
+// solid mode -- being fg it merges into the opaque stroke that covers it in pass
+// 3, so a solid stroke ends in a clean rounded nub instead of a ring. Subdivided
+// strokes' ports (and unused ports) keep the concentric rings -- the little
+// target/spiral circles. Each port belongs to at most one connection, so the
+// solid/subdivided choice per port is unambiguous (see solidPorts).
+void drawTileLineRings(Tile t, color fg) {
+  TileGeom gm = new TileGeom(t);
+  if (!gm.wings) return;
+  float fgR = gm.side / 6.0 * animDiscScale;
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_BUTT, BasicStroke.JOIN_ROUND));
+  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  boolean[] solidPort = solidPorts(gm, t);
+  float minR = linePitch() * 0.25;            // skip the ~0 (centre-line) ring
+  for (int k = 0; k < gm.fgWx.length; k++) {
+    if (solidPort[k]) {                        // solid stroke endpoint -> solid disc nub
+      float dd = 2 * fgR;
+      g2.fill(new Ellipse2D.Float(gm.fgWx[k] - fgR, gm.fgWy[k] - fgR, dd, dd));
+      continue;
+    }
+    for (float off : lineOffsets(2 * fgR)) {   // subdivided / unused -> concentric rings
+      if (off <= minR) continue;              // positive half only
+      float dd = 2 * off;
+      g2.draw(new Ellipse2D.Float(gm.fgWx[k] - off, gm.fgWy[k] - off, dd, dd));
+    }
+  }
+}
+
+// Which ports are endpoints of a full-thickness (non-subdivided) stroke -- those
+// get a solid disc nub rather than rings (see drawTileLineRings). Indexed like
+// gm.fgWx (regular: edge midpoints; trapezoid: TRAP_PORT order), and the
+// connection endpoints index into the same array.
+boolean[] solidPorts(TileGeom gm, Tile t) {
+  boolean[] sp = new boolean[gm.fgWx.length];
+  for (int ci = 0; ci < gm.conns.length; ci++)
+    if (!strokeSubdivided(t, ci)) {
+      int[] cn = gm.conns[ci];
+      if (cn[0] < sp.length) sp[cn[0]] = true;
+      if (cn[1] < sp.length) sp[cn[1]] = true;
+    }
+  return sp;
+}
+
+// Pass 2: the opaque ribbon base -- the solid side/3 band painted in the tile's
+// BACKGROUND colour, so it covers the rings under through-bands and any band/band
+// overlap. Clipped to the polygon like the solid path (safety for wide arcs), so
+// only the half of a port ring that spills into a neighbour survives -- a matched
+// neighbour's base covers that too (ring vanishes), an unmatched one leaves it as
+// the spiral cap. Whole hexagons (scheme != 2) keep their transparent batched
+// bundle, so they are skipped here.
+void drawTileRibbonBase(Tile t, color bg) {
+  TileGeom gm = new TileGeom(t);
+  if (!gm.hasBands()) return;
+  if (gm.n == 6 && colorScheme != 2) return;
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  boolean doClip = (gm.n != 6);
+  java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
+  Path2D.Float path = new Path2D.Float();
+  gm.appendBands(path);
+  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setPaint(awtColor(bg));
+  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
+  g2.draw(path);
+  if (doClip) popPolyClip(oldClip);
+}
+
+// Pass 3: the foreground -- per stroke, either the thin parallel/concentric line
+// bundle (subdivided) or the original full-thickness side/3 stroke. lineSubdivProb
+// is P(subdivided); the choice is a stable hash of the tile+connection (so it
+// holds per seed and updates live when the slider moves, no layout rebuild). Drawn
+// last so the bundles stay continuous across tile joins; the full-thickness ones,
+// being opaque fg, cover the pass-2 ribbon base under them. Whole hexagons defer
+// into the shared batch paths exactly as drawTileForeground does.
+void drawTileLineBundle(Tile t, color fg) {
+  TileGeom gm = new TileGeom(t);
+  if (gm.n == 6 && colorScheme != 2) {
+    for (int ci = 0; ci < gm.conns.length; ci++)
+      if (strokeSubdivided(t, ci))
+        for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendOneBand(hexBatch, ci, off);
+      else
+        gm.appendOneBand(hexSolidBatch, ci, 0);
+    hexBatchUsed = true;
+    hexBatchFg   = fg;
+    hexBatchSide = gm.side;
+    return;
+  }
+  if (!gm.hasBands()) return;
+  Graphics2D g2 = ((PGraphicsJava2D) g).g2;
+  Path2D.Float lines = new Path2D.Float();   // subdivided strokes
+  Path2D.Float solid = new Path2D.Float();   // full-thickness strokes
+  for (int ci = 0; ci < gm.conns.length; ci++) {
+    if (strokeSubdivided(t, ci))
+      for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendOneBand(lines, ci, off);
+    else
+      gm.appendOneBand(solid, ci, 0);
+  }
+  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
+  g2.draw(solid);
+  g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  g2.draw(lines);
+}
+
+// Stable per-stroke (tile + connection) coin flip: true => subdivide into the
+// line bundle, false => draw the original full-thickness stroke. A deterministic
+// hash of the tile's identity (so it's fixed per seed and doesn't reshuffle each
+// frame or when the slider moves), thresholded by lineSubdivProb. The endpoints
+// short-circuit so prob 1 is byte-identical to plain line mode.
+boolean strokeSubdivided(Tile t, int ci) {
+  if (lineSubdivProb >= 1.0) return true;
+  if (lineSubdivProb <= 0.0) return false;
+  int h = Float.floatToIntBits(t.cx);
+  h = h * 31 + Float.floatToIntBits(t.cy);
+  h = h * 31 + t.depth;
+  h = h * 31 + t.mi;
+  h = h * 31 + t.mk;
+  h = h * 31 + ci;
+  h ^= (h >>> 16); h *= 0x7feb352d; h ^= (h >>> 15); h *= 0x846ca68b; h ^= (h >>> 16);
+  return (h & 0x7fffffff) / 2147483647.0 < lineSubdivProb;
 }
 
 // ---- drop shadow (pass B) ----------------------------------------
@@ -536,6 +711,7 @@ Graphics2D beginShadowLayer() {
   sg.fillRect(0, 0, width, height);
   sg.setComposite(AlphaComposite.SrcOver);
   sg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+  sg.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
   sg.setColor(Color.BLACK);
   return sg;
 }
@@ -658,6 +834,7 @@ Graphics2D beginExtrudeLayer() {
   sg.fillRect(0, 0, width, height);
   sg.setComposite(AlphaComposite.SrcOver);       // slices accumulate opaquely
   sg.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+  sg.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
   sg.setColor(awtColor(sideColor()));
   return sg;
 }
@@ -688,8 +865,15 @@ void drawTileBands(TileGeom gm, color fg) {
   // hexagon bands overlap across edges with a ROUND cap (no clip there); square/
   // triangle/trapezoid end flush (CAP_BUTT) and rely on wings to bridge the edge.
   int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  if (lineMode) {                             // bundle of thin parallel/concentric lines
+    Path2D.Float lines = new Path2D.Float();
+    for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendBandsOffset(lines, off);
+    g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+    g2.draw(lines);
+    return;
+  }
+  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
   g2.draw(path);
 }
 
@@ -699,8 +883,14 @@ void drawTileBands(TileGeom gm, color fg) {
 // the depth-0 pass, before finer (triangle) tiles draw on top.
 void strokeHexBatch() {
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  g2.setStroke(new BasicStroke(hexBatchSide / 3.0 * animBandScale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  float hw = lineMode ? lineStroke() : hexBatchSide / 3.0 * animBandScale;   // bundle already in hexBatch
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(hexBatchFg));
+  // line mode: full-thickness strokes that opted out of subdivision, stroked at side/3.
+  if (lineMode) {
+    g2.setStroke(new BasicStroke(hexBatchSide / 3.0 * animBandScale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+    g2.draw(hexSolidBatch);
+  }
+  g2.setStroke(new BasicStroke(hw, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
   g2.draw(hexBatch);
 }
 
@@ -708,16 +898,19 @@ void strokeHexBatch() {
 // edges, else the circular arc (centre = intersection of the two edge lines)
 // sampled into a polyline fine enough (~3px/segment) to read as smooth.
 void appendConn(Path2D.Float path, int i, int j, int n,
-                float[] vx, float[] vy, float[] mx, float[] my) {
+                float[] vx, float[] vy, float[] mx, float[] my, float offset) {
   int d = min(abs(i - j), n - abs(i - j));
-  if (n % 2 == 0 && d == n / 2) {             // opposite -> straight band
-    path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]);
+  if (n % 2 == 0 && d == n / 2) {             // opposite -> straight band (perp. offset)
+    appendStraight(path, mx[i], my[i], mx[j], my[j], offset);
     return;
   }
   float[] c = lineIntersect(vx[i], vy[i], vx[(i + 1) % n], vy[(i + 1) % n],
                             vx[j], vy[j], vx[(j + 1) % n], vy[(j + 1) % n]);
-  if (c == null) { path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]); return; }
-  float r  = dist(mx[i], my[i], c[0], c[1]) * animArcRadius;   // anim: grow/shrink radius
+  if (c == null) { appendStraight(path, mx[i], my[i], mx[j], my[j], offset); return; }
+  // a constant radial offset == a constant perpendicular offset of the arc, so line
+  // bundles of abutting tiles stay aligned along the shared edge.
+  float r  = dist(mx[i], my[i], c[0], c[1]) * animArcRadius + offset;
+  if (r < 0.1) r = 0.1;
   float a0 = atan2(my[i] - c[1], mx[i] - c[0]);
   float a1 = atan2(my[j] - c[1], mx[j] - c[0]);
   float diff = a1 - a0;                        // shorter signed sweep -> interior arc
@@ -730,6 +923,17 @@ void appendConn(Path2D.Float path, int i, int j, int n,
     float px = c[0] + r * cos(ph), py = c[1] + r * sin(ph);
     if (k == 0) path.moveTo(px, py); else path.lineTo(px, py);
   }
+}
+
+// A straight band centre-line (ax,ay)->(bx,by), displaced perpendicular by `offset`.
+void appendStraight(Path2D.Float path, float ax, float ay, float bx, float by, float offset) {
+  if (offset != 0) {
+    float dx = bx - ax, dy = by - ay;
+    float dl = max(1e-6, sqrt(dx * dx + dy * dy));
+    float nx = -dy / dl * offset, ny = dx / dl * offset;   // unit normal * offset
+    ax += nx; ay += ny; bx += nx; by += ny;
+  }
+  path.moveTo(ax, ay); path.lineTo(bx, by);
 }
 
 // Processing colour int (0xAARRGGBB) -> opaque java.awt.Color.
