@@ -32,11 +32,12 @@ sketch must stay named `Multiscale_Truchet.pde` at the repo root.
 Running opens **three windows**: the visualization, a **Controls** panel, and a
 **Tiles** panel (per-shape archetype weights) — see "Multi-window architecture"
 below. Most parameters are adjustable live from the panels; the keyboard still
-works on the visualization window: **SPACE** = new seed, **4/3/6** =
-square/triangle/hexagon, **P/p** = prev/next palette, **R** = rotate palette,
+works on the visualization window: **SPACE** = new seed, **4/3/6/t** =
+square/triangle/hexagon/trapezoid, **P/p** = prev/next palette, **R** = rotate palette,
 **C** = colour scheme, **M** = symmetry (none/vertical/horizontal/quad/rot 180/
 tile mir V/H/quad), **e** = toggle 3D extrusion, **E** = cycle extrude mode
-(oblique/1-point), **S** = save `truchet-####.png`.
+(oblique/1-point), **a** = toggle animation, **g** = toggle base-grid overlay,
+**S** = save `truchet-####.png`.
 
 **Symmetry** (`symmetryMode`) comes in two mechanisms, deliberately different:
 
@@ -113,9 +114,24 @@ TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 TRUCHET_SEED=7 \
 ```
 
 renders one frame to `TRUCHET_OUT` and exits, skipping the GUI windows.
-Optional overrides: `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon),
-`TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_SYM` (0–7),
-`TRUCHET_GRID`, `TRUCHET_DEPTH` (0 = single scale), `TRUCHET_SHADOW` (0/1),
+**Resolution.** The canvas defaults to 1920×1080 but the tiling is fully
+resolution-independent (every length derives from `width`/`height`), so a larger
+canvas gives the SAME composition at higher resolution — a print/wallpaper export.
+Set size in `settings()` via `TRUCHET_W`/`TRUCHET_H` (explicit pixels) or
+`TRUCHET_SCALE` (multiply the default — `2` → 4K 3840×2160, `4` → 8K). These also
+enlarge the interactive window (window == canvas in Processing); for a "small
+window, big PNG" export use the headless path (`TRUCHET_OUT`), which opens no
+window. Big sizes cost memory (the shadow/extrude `BufferedImage` layers are
+`width*height*4` bytes each, ~133 MB apiece at 8K). Example:
+`TRUCHET_SCALE=2 TRUCHET_OUT=/tmp/4k.png processing-java --sketch=… --run`.
+Optional overrides: `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon, 3 trapezoid),
+`TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_PALETTE` (index, wraps),
+`TRUCHET_SYM` (0–7),
+`TRUCHET_SHOWGRID` (0/1 = overlay the base root-tile lattice on top of the render;
+re-derived from `buildRoots()` so it covers the whole canvas in every symmetry
+mode — see `drawGridOverlay`), `TRUCHET_GRID`, `TRUCHET_DEPTH` (0 = single scale), `TRUCHET_SUBDIV` (subdivide
+probability 0–1; `1` = uniform finest scale, handy for isolating subdivision
+behaviour from coarse/fine mixing), `TRUCHET_SHADOW` (0/1),
 `TRUCHET_SHADOW_STR` (darkness 0–1), `TRUCHET_SHADOW_SIZE` (offset, fraction of
 the band stroke; unclamped here for exaggerated tests), `TRUCHET_SHADOW_GLOBAL`
 (0 = per-level mask, 1 = one full-scene mask), `TRUCHET_INVERT` (0/1 = duotone
@@ -124,7 +140,25 @@ shadow on an inverted-level *background* reads as if the background were
 casting), `TRUCHET_EXTRUDE` (0/1 = 3D extrusion), `TRUCHET_EXTRUDE_MODE`
 (0 oblique, 1 one-point), `TRUCHET_VPX`/`TRUCHET_VPY` (vanishing point,
 normalised canvas coords, may be off-canvas), `TRUCHET_EXTRUDE_DEPTH` (fraction
-of tile side), `TRUCHET_EXTRUDE_SHADE` (side darkness 0–1). Use `--build` for a
+of tile side), `TRUCHET_EXTRUDE_SHADE` (side darkness 0–1).
+Animation (headless verification of motion — the loop never starts in headless;
+these pin a single deterministic frame): `TRUCHET_ANIM_T` (seconds → LFO-driven
+frame at that phase), `TRUCHET_ANIM_RATE` (master LFO Hz), `TRUCHET_ANIM_DEPTH`
+(set all LFO depths so motion is visible), and `TRUCHET_ANIM="name=v01,..."` to
+pin exact registry values (e.g. `discMod=1.0`, `rotationMod=0.85`), which also
+exercises the future MIDI sink.
+Image mode ("Truchet halftone" — see `ImageMode.pde`): `TRUCHET_IMG` (path to a
+source image → enables image mode), `TRUCHET_IMG_COLS` (mosaic columns; rows
+derived from the canvas aspect, = `gridN` in image mode), `TRUCHET_IMG_LIB`
+(brightness-library size, default 256), `TRUCHET_IMG_GAMMA` (gamma on sampled
+cell brightness; >1 darkens midtones), `TRUCHET_IMG_STRETCH` (0/1 = map image
+brightness across the library's full achievable range, default on),
+`TRUCHET_IMG_INVERT` (0/1 = invert the brightness→patch mapping),
+`TRUCHET_IMG_CONTAIN` (1 = fit the whole image and pad with the bright background,
+default; 0 = cover/crop to the canvas aspect). Combine with
+`TRUCHET_SCHEME`/`TRUCHET_PALETTE` (brightness is measured in the active palette),
+e.g. `TRUCHET_OUT=/tmp/o.png TRUCHET_IMG=/tmp/face.png TRUCHET_IMG_COLS=48`.
+Use `--build` for a
 quick compile check. Python+Pillow ports of the algorithm also exist for geometry checks
 without Processing (`preview.png`, `trapezoid_prototype.py`). Either way, when
 changing the tile geometry, render and *look* at the result rather than
@@ -248,14 +282,18 @@ the grid — the hex grid is a correct staggered tessellation).
 
 ## Structure of the sketch
 
-Four `.pde` tabs (Processing merges them into one PApplet):
+The `.pde` tabs are merged into one PApplet:
 
 - **`Multiscale_Truchet.pde`** — globals, `setup()`/`draw()`, colour, keys.
   `draw()` calls `buildRoots()`, recursively `collectTile()`s into the global
   `ArrayList<Tile> leaves`, then draws **coarse-first** (loop over depth) — the
   layering winged tiles depend on. `collectTile()` either subdivides
   (`canSubdivide()` && `random < subdivideProb`) or records a leaf. Do not draw
-  during recursion; it breaks the coarse-first layering.
+  during recursion; it breaks the coarse-first layering. The coarse-first draw
+  loop is factored into `renderTiling()` (operates on the global `leaves`) so
+  image mode can reuse it for both its calibration rounds and the final mosaic;
+  `draw()` either takes the image-mode branch (`drawImageMode()`) or the normal
+  background → `rebuildLeaves()` → `renderTiling()` → `applySymmetry()` path.
   **Drop shadows** render each depth level in three passes — all backgrounds,
   then ONE unioned shadow mask (every caster offset by `shadowSize·side/3` along
   `shadowAngle`, drawn opaque into an offscreen `BufferedImage`, composited once
@@ -290,8 +328,8 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   with `extrude3D` off, `draw()` is byte-for-byte the original path.
 - **`Shapes.pde`** — the generalized n-gon engine, added when triangle/hexagon
   support landed. A `Tile` is `(cx, cy, R, rot, n, depth)`. `shapeMode`
-  (0/1/2 → square/triangle/hexagon, keys 4/3/6) drives `buildRoots()`
-  (`squareRoots`/`triangleRoots`/`hexagonRoots`) and `children()` (square
+  (0/1/2/3 → square/triangle/hexagon/trapezoid, keys 4/3/6/t) drives `buildRoots()`
+  (`squareRoots`/`triangleRoots`/`hexagonRoots`/`trapezoidRoots`) and `children()` (square
   quadtree; triangle rep-tile = 3 corner + 1 flipped medial; hexagon = 6
   equilateral triangles fanning from the centre, which then recurse as n==3 —
   `canSubdivide` is just `depth < maxDepth`). `drawPolyTile()` draws one
@@ -306,6 +344,41 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   the clip is released so they still spill. Hexagons skip the clip and use
   `ROUND` stroke caps so bands overlap across shared edges (closing the AA seam
   that wings hide on the other shapes).
+  - **Trapezoid** (`shapeMode == 3`, the **half-hexagon**, ported from
+    `trapezoid_prototype.py`) is the one shape that is *not* a regular n-gon, so it
+    bypasses the `(cx,cy,R,rot,n)` vertex math: a trapezoid `Tile` carries a complex
+    **similarity** `(p0, e)` in a y-up *canonical* frame (`world(z) = p0 + z·e`; the
+    canonical unit tile has short edge 1, long edge 2, height √3/2 — see `TRAP_V`),
+    flagged `Tile.trap`, with `cx/cy` holding the screen centroid and `n` left at 4
+    (the polygon vertex count, for bg fill + clip). Its long edge carries **two
+    ports** (5 ports total: `TRAP_PORT` = B1,B2,R,T,L), so 5 is odd and one port is
+    always unmatched — the fg wing nub caps it. All six connections are circular
+    **arcs** with explicit canonical centres (`trapArcSpec`, centres lie on both
+    ports' edge lines → perpendicular crossings, width 1/3); the L–R "sweep" centres
+    on the cut-off apex. `trapezoidRoots()` lays the staggered up/down lattice
+    (`e = ±1`). **Subdivision is lattice-preserving** (`children()`): a half-hexagon
+    trapezoid is exactly **3 unit equilateral triangles** (`TRAP_TRIS`, two up + one
+    down), so it splits into those — transformed to screen via `(p0,e)` and recorded
+    as `n==3` tiles, which then recurse with the triangle rep-tile rule (the same
+    strategy the hexagon uses; whole trapezoids stay the coarse scale, finer detail
+    is triangular). The 3 triangles' boundary edges reproduce the trapezoid's exact
+    port lattice — the long edge = the two up-triangles' bases (2 ports), the top
+    edge = the down-triangle's base (1), each leg = one triangle edge (1) — so a
+    whole trapezoid and a subdivided one connect seamlessly, giving the classical
+    continuous multi-scale pattern. (An earlier rep-4 split into 4 rotated
+    half-trapezoids would have moved the children's ports off the connection lattice;
+    it also never ran, because a trapezoid has `n==4` and was caught by the square
+    quadtree branch — `children()` now tests `t.trap` **before** `t.n`.)
+    `TileGeom.initTrap()` builds the *whole-trapezoid* screen geometry and exposes
+    the *shape-neutral* interface every render pass reads: `vx/vy` (outline),
+    `bgWx/bgWy` + `fgWx/fgWy` (wing-disc centres — 5 corners / 5 ports for the
+    trapezoid, vertices / edge midpoints for regular shapes), `wings`, `side`, and
+    `appendBands()` (centre-lines: `appendConn` for regular, `appendTrapConn` for the
+    trapezoid). It uses the same `side/3` clip + wings path as square/triangle. The
+    structural symmetry modes (4–7, grid-specific) are skipped for it
+    (`rebuildLeaves`); pixel mirrors (1–3) still apply. Whole-trapezoid tile weights
+    live in `TRAP_W` (not `weightsFor(n)`, which would alias the square); subdivided
+    detail uses the triangle alphabet (`TRI_CONNS`/`TRI_W`).
 - **`Palettes.pde`** — `PaletteManager`/`Palette`; colour source. `colorScheme`
   (`schemeName`) selects one of four: duotone (lightest/darkest, inverted per
   level), multi (`ribbonColor()`: light ground, one palette colour per level),
@@ -322,25 +395,91 @@ Four `.pde` tabs (Processing merges them into one PApplet):
   `p`/`P` palettes, `R` rotate palette colour order (`Palette.rotate`), `C`
   scheme. There is no `cDark`/`cLight`. The gradient schemes pick via `random()`,
   so `draw()` re-seeds (`randomSeed(seedVal)`) after `setupGradient()` to keep the
-  tile layout identical across schemes.
+  tile layout identical across schemes. `loadDefaults()` seeds **45** palettes
+  from the COLOURlovers all-time most-loved list (hex verified against two
+  verbatim top-100 dumps); `loadFromColourLovers()` can still refresh live but is
+  Cloudflare-blocked in practice. To bake in more, add `fromHex(...)` lines there.
 - **`ControlWindow.pde`** — a second PApplet (own window, launched in `setup()`
   via `runSketch`) with immediate-mode sliders/buttons writing straight to the
   main sketch's globals (`parent.*`) and calling `parent.redraw()`. If you add a
-  tunable global, add a widget here too.
+  tunable global, add a widget here too. The bottom **Image mode** section
+  (img cols/lib/gamma sliders, image/stretch/invert toggles, a `selectInput`
+  "Load image…" button) drives the Truchet halftone; its widgets set `imgDirty`.
 - **`TileWindow.pde`** — a third PApplet window listing the active shape's tile
-  **archetypes** (`parent.connsFor(n)` — base connection sets, no rotations) with
-  a slider per archetype that writes its selection weight into
-  `parent.weightsFor(n)` (the same `TILE_W`/`TRI_W`/`HEX_W` `pickWeighted` reads)
-  and calls `parent.redraw()`. It draws each archetype with its own
-  `drawArchetype()` (a compact copy of the band geometry, using `parent.lineIntersect`)
-  since drawing must target *this* window's canvas, not the main one. It reads
-  `parent.shapeMode` each frame, so it relists automatically when the shape changes.
+  **archetypes** (`parent.connsFor(n)`, or `parent.TRAP_CONNS` for the trapezoid —
+  base connection sets, no rotations) with a slider per archetype that writes its
+  selection weight into `parent.weightsFor(n)` / `parent.TRAP_W` (the same
+  `TILE_W`/`TRI_W`/`HEX_W`/`TRAP_W` `pickWeighted` reads) and calls
+  `parent.redraw()`. It draws each archetype with its own `drawArchetype()` (a
+  compact copy of the band geometry, using `parent.lineIntersect`) — or
+  `drawTrapArchetype()` (sampling `parent.trapArcSpec`) for the trapezoid — since
+  drawing must target *this* window's canvas, not the main one. It reads
+  `parent.shapeMode` each frame, so it relists automatically when the shape changes
+  (the window is sized tall enough for the trapezoid's 8 archetypes).
+- **`Animation.pde`** — the animation engine. The tile layout is stable per seed,
+  so animation never rebuilds tiles: it modulates *render-time* geometry. A small
+  registry (`AnimState anim`, normalized `volatile` `-1..+1` values:
+  `bandWidthMod/discMod/rotationMod/arcSweepMod/arcRadiusMod/colorMod`) is the
+  single sink — `setAnimValue(name, v01)` is the **thread-safe MIDI seam** a future
+  Windows-host `javax.sound.midi` handler will write to. For now per-target `Lfo`s
+  on a deterministic clock (`animSeconds`) drive it (`driveAnimFromLFOs`,
+  `animSource == 0`). `draw()` calls `updateAnim()` once at the top, which advances
+  the clock and writes the read-only frame-globals (`animBandScale`, `animDiscScale`,
+  `animArcSweep`, `animArcRadius`, `animRotOffset`) the render passes multiply into
+  the `side/3` strokes, disc radii, arc `r`/`diff`, and `TileGeom` rotation. When
+  animation is off these are identity, so a static frame is byte-identical to before.
+  `setAnimEnabled()` flips `noLoop()` ↔ `loop()`. **Connection-safe** modulators:
+  `discMod` (and `colorMod`, reserved). **Connection-breaking** (intentional, the
+  expressive set): `bandWidthMod`, `arcSweepMod`, `arcRadiusMod`, `rotationMod` —
+  they move band edge-crossings off the 1/3–2/3 points so ribbons no longer meet at
+  edges. Controls default the safe channel on, breaking ones at depth 0 (labelled
+  `*` in the panel).
+- **`ImageMode.pde`** — **Truchet halftone**: render a source image as a mosaic of
+  multi-scale Truchet patches chosen by brightness (ASCII-art, but the "glyphs"
+  are little tilings). Two phases, both reusing `collectTile` + `renderTiling`:
+  **(1) calibration** (`buildLibrary`) generates `libSize` candidate patches —
+  each one square cell subdivided from its own RNG seed (`collectPatch` pins the
+  seed *and* `subdivideProb`, which is swept across `[0,1]` so the library spans
+  sparse/bright → dense/dark) — renders them batched on the canvas and reads back
+  each one's mean luminance via `loadPixels()` (ignoring a guard ring to avoid
+  neighbour wing-spill); **(2) compose** (`buildMosaic`) lays the square grid
+  (`gridN = imgCols`), area-samples the image per cell (`sampleGrid` cover-crops to
+  the grid aspect), and places the patch whose measured brightness best matches
+  (`sortLibrary` + `pickPatch`, nearest among K by a position hash so equal cells
+  don't all repeat one patch), then renders the whole mosaic. Brightness is read
+  off the *rendered* pixels in the active palette, so the mapping is faithful to
+  any colour scheme (duotone reads cleanest). On load, `flattenOntoWhite()`
+  composites any transparency onto white — **essential for logo/SVG PNGs**, whose
+  transparent background is stored as RGB (0,0,0), identical to a black foreground,
+  so without it the whole image samples as uniform black and collapses to one
+  repeated patch. `sampleGrid` reduces the image to the cell grid in one of two
+  fit modes (`imgContain`: contain + pad with the bright bg, default, nothing
+  cropped — good for logos; else cover/crop — good for photos). Cached via
+  `imgDirty`: rebuilt only
+  when the image, mapping params, palette/scheme, or any patch-appearance global
+  (depth, subdiv, winged, invert) changes. `imageChosen()` is the Controls
+  "Load image…" `selectInput` callback. **The patch's intrinsic brightness is
+  measured in isolation; the final mosaic adds a little uniform darkening from
+  neighbours' overlapping wings — acceptable, and the histogram-stretch + nearest
+  match absorb it. If you change tile geometry/colour, the library must be
+  remeasured (it is, on `imgDirty`).**
+- **Layout caching** (main tab): `leaves`/gradient are rebuilt only when
+  `dirtyLayout`/`dirtyGradient` are set (in `rebuildLeaves`/`setupGradient` guards),
+  not every animated frame. Every layout-affecting mutator (seed, grid, depth,
+  subdiv, shape, symmetry, tile weights) sets `dirtyLayout`; palette/scheme set
+  `dirtyGradient`; image-mode mutators set `imgDirty`. If you add a mutator that
+  changes the tiling or colours, set the matching flag or the change won't show
+  while animating.
 
 Per-shape alphabets: `TILE_CONNS`/`TILE_W` (square, in the main tab), `TRI_CONNS`
 (triangle: blank + single arc — one port per edge allows at most one arc),
 `HEX_CONNS` (whole-hexagon tiles: fully-connected matchings only — including
 distance-2 "sweeping" arcs; a subdivided hexagon becomes triangles and uses
-`TRI_CONNS`). `connsFor(n)`/`weightsFor(n)` pick the right one.
+`TRI_CONNS`), and `TRAP_CONNS`/`TRAP_W` (trapezoid: 8 motifs over its **5 ports**,
+indices into `TRAP_PORT`, not edges). `connsFor(n)`/`weightsFor(n)` pick the right
+one for the regular shapes; the trapezoid is keyed on `Tile.trap` instead (its `n`
+is 4 and would otherwise alias the square), so `collectTile`, `TileGeom`, and the
+panels branch on `trap`/`shapeMode == 3` to reach `TRAP_CONNS`/`TRAP_W`.
 
 ## Multi-window architecture (control panels)
 

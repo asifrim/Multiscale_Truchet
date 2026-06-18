@@ -37,9 +37,9 @@ import java.awt.AlphaComposite;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 
-int shapeMode = 0;                         // 0 = square, 1 = triangle, 2 = hexagon
-String[] SHAPE_NAMES = { "square", "triangle", "hexagon" };
-int[]    SHAPE_N     = { 4, 3, 6 };
+int shapeMode = 0;                         // 0 = square, 1 = triangle, 2 = hexagon, 3 = trapezoid
+String[] SHAPE_NAMES = { "square", "triangle", "hexagon", "trapezoid" };
+int[]    SHAPE_N     = { 4, 3, 6, 4 };     // [3] is nominal; trapezoid uses Tile.trap, not n
 
 // Whole-hexagon band batching (see drawPolyTile / strokeHexBatch). Hexagons are
 // all depth 0 and (except the per-tile mode 2) share one colour, so their bands
@@ -58,10 +58,82 @@ class Tile {
                           // collectTile so a symmetry twin can reuse its source's motif
   boolean flip = false;   // mirror twin: reverse the vertex winding (see TileGeom),
                           // which draws the exact mirror image of the motif
+  // --- trapezoid tiles (shapeMode 3) ---------------------------------------
+  // The half-hexagon trapezoid is NOT a regular n-gon (irregular vertices, and
+  // its long edge carries TWO ports -> 5 ports total), so it can't be described
+  // by (cx,cy,R,rot,n). Instead it stores a complex SIMILARITY in a y-up
+  // "canonical" frame: world(z) = p0 + z*e, with the canonical unit tile from
+  // trapezoid_prototype.py. cx/cy still hold the SCREEN centroid (for culling +
+  // gradient colour); n stays 4 (the polygon's vertex count, used for clip/fill).
+  boolean trap = false;
+  float p0x, p0y, ex, ey;   // canonical placement (complex p0 and e)
   Tile(float cx, float cy, float R, float rot, int n, int depth) {
     this.cx = cx; this.cy = cy; this.R = R; this.rot = rot;
     this.n = n; this.depth = depth;
   }
+}
+
+// ---- trapezoid (half-hexagon) tile, ported from trapezoid_prototype.py -----
+// Canonical tile (short edge = 1), vertices CCW with the long edge first:
+//   V0(0,0) V1(2,0) V2(1.5,H) V3(0.5,H),  H = sqrt(3)/2.
+// The long edge V0->V1 holds two ports (Mitchell's multiple-points-per-side
+// generalization); every port is the central third of a unit segment, so band
+// width is 1/3 everywhere and the multi-scale thirds invariant holds. Ports are
+// indexed 0=B1, 1=B2, 2=R, 3=T, 4=L (see TRAP_PORT). All six connections are
+// circular arcs whose centre lies ON both ports' edge lines, so bands cross
+// edges perpendicularly with crossing width 1/3.
+final float TRAP_H = 0.86602540378;            // sqrt(3)/2
+float trapPPU = 100;                            // pixels per canonical unit (set in trapezoidRoots)
+
+// polygon vertices (for bg fill + clip), 4
+final float[][] TRAP_V    = { {0,0}, {2,0}, {1.5,TRAP_H}, {0.5,TRAP_H} };
+// background wing-disc centres (4 corners + the base-midpoint "virtual corner"), 5
+final float[][] TRAP_CORN = { {0,0}, {2,0}, {1.5,TRAP_H}, {0.5,TRAP_H}, {1,0} };
+// foreground wing-nub centres = the 5 ports (B1,B2,R,T,L). 5 is odd, so one port
+// is always unmatched per motif -- its nub caps it.
+final float[][] TRAP_PORT = { {0.5,0}, {1.5,0}, {1.75,TRAP_H/2}, {1.0,TRAP_H}, {0.25,TRAP_H/2} };
+
+// motif alphabet: lists of port-index pairs (cf. TILE_CONNS but with 5 ports).
+int[][][] TRAP_CONNS = {
+  { {4,0}, {2,1} },   // L-B1 + R-B2
+  { {4,0}, {3,2} },   // L-B1 + T-R
+  { {4,3}, {2,1} },   // L-T  + R-B2
+  { {4,3}, {0,1} },   // L-T  + B1-B2
+  { {3,2}, {0,1} },   // T-R  + B1-B2
+  { {4,2}, {0,1} },   // L-R sweep + B1-B2
+  { {0,1}          },  // B1-B2 only
+  { {4,2}          },  // L-R sweep only
+};
+float[] TRAP_W = { 3, 3, 3, 3, 3, 4, 1, 1 };
+
+// Subdivision: a half-hexagon trapezoid is EXACTLY 3 unit equilateral triangles
+// (two up + one down), so it splits into those and recurses them as n==3 tiles --
+// the lattice-preserving strategy the hexagon uses. (The earlier rep-4 split into
+// 4 rotated half-trapezoids tiled by area but moved the children's ports OFF the
+// connection lattice, so subdivided trapezoids didn't connect; see children().)
+// Each entry is one triangle's 3 canonical vertices. The triangles' boundary
+// edges reproduce the trapezoid's exact port structure -- the long edge is the
+// two up-triangles' bases (2 ports), the top edge the down-triangle's base (1),
+// each leg one triangle edge (1) -- so a whole trapezoid and a subdivided one
+// connect seamlessly, and adjacent subdivided trapezoids share the native
+// triangle lattice.
+final float[][][] TRAP_TRIS = {
+  { {0,0},       {1,0},       {0.5, TRAP_H} },   // A: up   (base = left half of long edge)
+  { {0.5,TRAP_H},{1.5,TRAP_H},{1.0, 0}      },   // B: down (base = top edge)
+  { {1,0},       {2,0},       {1.5, TRAP_H} },   // C: up   (base = right half of long edge)
+};
+
+// Arc spec for a trapezoid connection between ports i,j (any order):
+// { centreX, centreY, midRadius, startDeg, endDeg } in CANONICAL coords, CCW.
+// Centres sit on both ports' edge lines => perpendicular crossings, width 1/3.
+float[] trapArcSpec(int a, int b) {
+  int lo = min(a, b), hi = max(a, b);
+  if (lo == 0 && hi == 1) return new float[]{ 1.0,      0.0,         0.5, 0,   180 };  // B1-B2 U-turn
+  if (lo == 1 && hi == 2) return new float[]{ 2.0,      0.0,         0.5, 120, 180 };  // R-B2 corner
+  if (lo == 2 && hi == 3) return new float[]{ 1.5,      TRAP_H,      0.5, 180, 300 };  // T-R  corner
+  if (lo == 3 && hi == 4) return new float[]{ 0.5,      TRAP_H,      0.5, 240, 360 };  // L-T  corner
+  if (lo == 0 && hi == 4) return new float[]{ 0.0,      0.0,         0.5, 0,   60  };  // L-B1 corner
+  return                         new float[]{ 1.0, 1.7320508,        1.5, 240, 300 };  // L-R sweep (apex)
 }
 
 // ---- per-shape tile alphabets ----------------------------------
@@ -89,6 +161,7 @@ float[]   weightsFor(int n) { return n == 3 ? TRI_W     : (n == 6 ? HEX_W     : 
 
 // ---- building the top-level tiling -----------------------------
 ArrayList<Tile> buildRoots() {
+  if (shapeMode == 3) return trapezoidRoots();
   int n = SHAPE_N[shapeMode];
   if (n == 3) return triangleRoots();
   if (n == 6) return hexagonRoots();
@@ -149,6 +222,49 @@ ArrayList<Tile> hexagonRoots() {
   return roots;
 }
 
+// Trapezoid (half-hexagon) field. Up- and down-pointing trapezoids tile the
+// plane two-per-row on a staggered lattice (matching trapezoid_prototype.py's
+// render_field): an "up" tile has e = (1,0), a "down" tile e = (-1,0) (a 180
+// flip). Canonical y is up; the per-tile transform (see TileGeom) flips it to
+// screen. trapPPU sizes the field so ~gridN tiles span the width (each lattice
+// column is 3 canonical units wide).
+ArrayList<Tile> trapezoidRoots() {
+  ArrayList<Tile> roots = new ArrayList<Tile>();
+  trapPPU = (float) width / (gridN * 3.0);
+  float ppu = trapPPU;
+  int cols = ceil(width / ppu / 3.0) + 2;
+  int rows = ceil(height / ppu / TRAP_H) + 2;
+  for (int k = -1; k < rows; k++) {
+    float shift = 1.5 * (k & 1);
+    for (int j = -2; j < cols; j++) {
+      roots.add(trapTile(3 * j + shift,         k * TRAP_H,        1, 0, 0));   // up
+      roots.add(trapTile(3 * j + 3.5 + shift,  (k + 1) * TRAP_H,  -1, 0, 0));   // down
+    }
+  }
+  return roots;
+}
+
+// Build a trapezoid Tile from its canonical placement (p0, e). cx/cy hold the
+// SCREEN centroid (canonical centroid (1, H/2)); R approximates the tile size.
+Tile trapTile(float p0x, float p0y, float ex, float ey, int depth) {
+  float ccx = trapSX(p0x, p0y, ex, ey, 1.0, TRAP_H / 2.0);
+  float ccy = trapSY(p0x, p0y, ex, ey, 1.0, TRAP_H / 2.0);
+  float side = sqrt(ex * ex + ey * ey) * trapPPU;
+  Tile t = new Tile(ccx, ccy, side, 0, 4, depth);
+  t.trap = true;
+  t.p0x = p0x; t.p0y = p0y; t.ex = ex; t.ey = ey;
+  return t;
+}
+
+// Canonical point (zx,zy) -> screen X / Y under placement (p0,e). Canonical y is
+// up; screen y is down, hence the flip.
+float trapSX(float p0x, float p0y, float ex, float ey, float zx, float zy) {
+  return (p0x + (zx * ex - zy * ey)) * trapPPU;
+}
+float trapSY(float p0x, float p0y, float ex, float ey, float zx, float zy) {
+  return height - (p0y + (zx * ey + zy * ex)) * trapPPU;
+}
+
 // ---- subdivision -----------------------------------------------
 boolean canSubdivide(Tile t) {
   return t.depth < maxDepth;   // squares->squares, triangles->triangles, hexagons->6 triangles
@@ -156,7 +272,27 @@ boolean canSubdivide(Tile t) {
 
 ArrayList<Tile> children(Tile t) {
   ArrayList<Tile> ch = new ArrayList<Tile>();
-  if (t.n == 4) {
+  // NB: test t.trap BEFORE t.n -- a trapezoid has n==4 (its polygon vertex count)
+  // and would otherwise be caught by the square branch and subdivided as squares.
+  if (t.trap) {
+    // Split into the 3 equilateral triangles (TRAP_TRIS), transformed from the
+    // tile's canonical frame to screen via its (p0,e) placement, then recorded as
+    // n==3 tiles -- which recurse with the triangle rep-tile rule below. Whole
+    // trapezoids stay the coarse scale; finer detail is triangular (cf. hexagon).
+    // The triangles' boundary edges reproduce the trapezoid's exact port lattice,
+    // so a whole trapezoid and a subdivided one connect seamlessly.
+    for (float[][] tri : TRAP_TRIS) {
+      float ax = trapSX(t.p0x, t.p0y, t.ex, t.ey, tri[0][0], tri[0][1]);
+      float ay = trapSY(t.p0x, t.p0y, t.ex, t.ey, tri[0][0], tri[0][1]);
+      float bx = trapSX(t.p0x, t.p0y, t.ex, t.ey, tri[1][0], tri[1][1]);
+      float by = trapSY(t.p0x, t.p0y, t.ex, t.ey, tri[1][0], tri[1][1]);
+      float cx = trapSX(t.p0x, t.p0y, t.ex, t.ey, tri[2][0], tri[2][1]);
+      float cy = trapSY(t.p0x, t.p0y, t.ex, t.ey, tri[2][0], tri[2][1]);
+      Tile tt = triFromVerts(ax, ay, bx, by, cx, cy);
+      tt.depth = t.depth + 1;
+      ch.add(tt);
+    }
+  } else if (t.n == 4) {
     float s = t.R * sqrt(2), off = s / 4.0;
     ch.add(new Tile(t.cx - off, t.cy - off, t.R / 2, t.rot, 4, t.depth + 1));
     ch.add(new Tile(t.cx + off, t.cy - off, t.R / 2, t.rot, 4, t.depth + 1));
@@ -199,20 +335,37 @@ ArrayList<Tile> children(Tile t) {
 // same-level band, regardless of tile order inside the level. The motif is
 // fixed on the Tile (mi/mk, chosen in collectTile), so all passes agree.
 
-// Per-pass geometry of a placed tile: polygon vertices, edge midpoints, side.
+// Per-pass geometry of a placed tile. The render passes read it through a shape-
+// neutral interface: vx/vy (polygon outline, for bg fill + clip), bgWx/bgWy +
+// fgWx/fgWy (background and foreground wing-disc centres), `side` (short-edge
+// length -> band stroke side/3, discs side/3 & side/6), `wings`, and appendBands()
+// (the band centre-lines). For regular n-gons the wing centres are the vertices
+// (bg) and edge midpoints (fg); the trapezoid supplies its own 5 corners + 5 ports.
 class TileGeom {
+  boolean trap;
   int n; int[][] conns;
-  float[] vx, vy, mx, my;
+  float[] vx, vy, mx, my;          // polygon vertices + edge midpoints (regular)
+  float[] bgWx, bgWy, fgWx, fgWy;  // wing-disc centres (bg corners / fg ports)
+  boolean wings;
   float side;
+  // trapezoid effective placement (p0,e with animRotOffset folded in about the centroid)
+  float tpx, tpy, tex, tey;
+
   TileGeom(Tile t) {
+    trap = t.trap;
     n = t.n;
+    if (trap) { initTrap(t); return; }
+
     conns = connsFor(n)[t.mi];
     // flip = mirror twin: wind the vertices the other way (and negate the motif
     // rotation), which renders the exact mirror image of the source's motif --
     // edge k of the flipped tile is the reflection of edge k of the source, so
     // the connection list applies unchanged.
     float dir = t.flip ? -1 : 1;
-    float rot = t.rot + dir * t.mk * (TWO_PI / n);   // motif rotation (chosen in collectTile)
+    // motif rotation (chosen in collectTile) + the animation rotation offset
+    // (animRotOffset is 0 when animation is off; non-zero spins the whole tile,
+    // which BREAKS the seamless cross-tile connection -- expressive, see Animation.pde).
+    float rot = t.rot + dir * t.mk * (TWO_PI / n) + dir * animRotOffset;
     vx = new float[n]; vy = new float[n];
     for (int k = 0; k < n; k++) {
       float a = rot + dir * TWO_PI * k / n;
@@ -226,6 +379,68 @@ class TileGeom {
       my[k] = (vy[k] + vy[k2]) / 2;
     }
     side = dist(vx[0], vy[0], vx[1], vy[1]);
+    wings = winged && n != 6;
+    bgWx = vx; bgWy = vy;        // bg discs at the vertices
+    fgWx = mx; fgWy = my;        // fg nubs at the edge midpoints
+  }
+
+  // Trapezoid: fold animRotOffset (a spin about the canonical centroid Cc) into
+  // the effective placement, then transform the canonical vertices/corners/ports.
+  // Rotating z about Cc by theta and applying p0 + z*e is the same as a new
+  // similarity (p0', e') with e' = e*e^{i*theta} and p0' = p0 + Cc*e - Cc*e'.
+  void initTrap(Tile t) {
+    conns = TRAP_CONNS[t.mi];
+    float th = animRotOffset;                 // 0 when animation is off -> identity
+    float c = cos(th), s = sin(th);
+    float epx = t.ex * c - t.ey * s, epy = t.ex * s + t.ey * c;   // e' = e*e^{i th}
+    float Ccx = 1.0, Ccy = TRAP_H / 2.0;
+    // p0' = p0 + Cc*e - Cc*e'  (complex)
+    tpx = t.p0x + (Ccx * t.ex - Ccy * t.ey) - (Ccx * epx - Ccy * epy);
+    tpy = t.p0y + (Ccx * t.ey + Ccy * t.ex) - (Ccx * epy + Ccy * epx);
+    tex = epx; tey = epy;
+    side = sqrt(t.ex * t.ex + t.ey * t.ey) * trapPPU;
+
+    vx = new float[TRAP_V.length];    vy = new float[TRAP_V.length];
+    for (int k = 0; k < TRAP_V.length; k++)    { vx[k] = tsx(TRAP_V[k][0], TRAP_V[k][1]);    vy[k] = tsy(TRAP_V[k][0], TRAP_V[k][1]); }
+    bgWx = new float[TRAP_CORN.length]; bgWy = new float[TRAP_CORN.length];
+    for (int k = 0; k < TRAP_CORN.length; k++) { bgWx[k] = tsx(TRAP_CORN[k][0], TRAP_CORN[k][1]); bgWy[k] = tsy(TRAP_CORN[k][0], TRAP_CORN[k][1]); }
+    fgWx = new float[TRAP_PORT.length]; fgWy = new float[TRAP_PORT.length];
+    for (int k = 0; k < TRAP_PORT.length; k++) { fgWx[k] = tsx(TRAP_PORT[k][0], TRAP_PORT[k][1]); fgWy[k] = tsy(TRAP_PORT[k][0], TRAP_PORT[k][1]); }
+    wings = winged;                   // 5 ports is odd -> always need nub caps
+  }
+
+  // canonical (zx,zy) -> screen, using the effective placement (incl. anim spin).
+  float tsx(float zx, float zy) { return (tpx + (zx * tex - zy * tey)) * trapPPU; }
+  float tsy(float zx, float zy) { return height - (tpy + (zx * tey + zy * tex)) * trapPPU; }
+
+  boolean hasBands() { return conns.length > 0; }
+
+  // Append every connection's centre-line to `path` as a subpath. Regular tiles
+  // use the edge-pair construction (appendConn); trapezoids use their explicit
+  // arc specs (appendTrapConn). Stroked at width side/3 by the caller.
+  void appendBands(Path2D.Float path) {
+    if (trap) {
+      for (int[] cn : conns) appendTrapConn(path, cn[0], cn[1]);
+    } else {
+      for (int[] cn : conns) appendConn(path, cn[0], cn[1], n, vx, vy, mx, my);
+    }
+  }
+
+  // One trapezoid connection: a circular arc (in canonical coords) sampled into a
+  // screen-space polyline. animArcRadius/animArcSweep modulate it exactly as
+  // appendConn does for regular tiles (both 1.0 when animation is off).
+  void appendTrapConn(Path2D.Float path, int a, int b) {
+    float[] sp = trapArcSpec(a, b);
+    float r  = sp[2] * animArcRadius;
+    float a0 = radians(sp[3]);
+    float diff = (radians(sp[4]) - a0) * animArcSweep;
+    int seg = max(8, ceil(r * side * abs(diff) / 3.0));   // r*side = screen arc radius
+    for (int k = 0; k <= seg; k++) {
+      float ph = a0 + diff * k / seg;
+      float zx = sp[0] + r * cos(ph), zy = sp[1] + r * sin(ph);
+      float px = tsx(zx, zy), py = tsy(zx, zy);
+      if (k == 0) path.moveTo(px, py); else path.lineTo(px, py);
+    }
   }
 }
 
@@ -250,15 +465,16 @@ void drawTileBackground(Tile t, color bg) {
   // Whole hexagon tiles need no wings (they're a uniform coarse layer); their
   // bands use ROUND caps (see drawTileBands) to overlap across shared edges.
   // (A subdivided hexagon becomes n==3 triangles, which DO get wings.)
-  if (winged && gm.n != 6) {
+  if (gm.wings) {
     // Drawn in the default CENTER ellipseMode using DIAMETERS (2*radius). Do NOT
     // switch to ellipseMode(RADIUS): arc() also honours ellipseMode, so leaving
     // it on RADIUS makes later arc() calls (here and in the next frame) read
     // their diameter args as radii -- doubling the arcs into a chunky mess.
     noStroke();
-    fill(bg);                                          // vertex discs, r = side/3
-    for (int k = 0; k < gm.n; k++)
-      ellipse(gm.vx[k], gm.vy[k], 2 * gm.side / 3.0, 2 * gm.side / 3.0);
+    fill(bg);                                          // corner discs, r = side/3 (* anim)
+    float bgD = 2 * gm.side / 3.0 * animDiscScale;
+    for (int k = 0; k < gm.bgWx.length; k++)
+      ellipse(gm.bgWx[k], gm.bgWy[k], bgD, bgD);
   }
 }
 
@@ -275,25 +491,26 @@ void drawTileForeground(Tile t, color fg) {
     // whole hexagons (uniform colour): defer the bands into the shared batch
     // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
     // is per-tile coloured, so it can't batch and falls through to per-tile.
-    for (int[] c : gm.conns) appendConn(hexBatch, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
+    gm.appendBands(hexBatch);
     hexBatchUsed = true;
     hexBatchFg   = fg;
     hexBatchSide = gm.side;
   } else {
     boolean doClip = (gm.n != 6);
-    java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.n) : null;
-    drawTileBands(gm.conns, gm.n, gm.vx, gm.vy, gm.mx, gm.my, gm.side, fg);
+    java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
+    drawTileBands(gm, fg);
     if (doClip) popPolyClip(oldClip);
   }
 
-  if (winged && gm.n != 6) {
+  if (gm.wings) {
     noStroke();
     if (gradientStroke()) {
-      for (int k = 0; k < gm.n; k++) fillDiscG2(gm.mx[k], gm.my[k], gm.side / 6.0);
+      for (int k = 0; k < gm.fgWx.length; k++) fillDiscG2(gm.fgWx[k], gm.fgWy[k], gm.side / 6.0 * animDiscScale);
     } else {
       fill(fg);
-      for (int k = 0; k < gm.n; k++)
-        ellipse(gm.mx[k], gm.my[k], gm.side / 3.0, gm.side / 3.0);
+      float fgD = gm.side / 3.0 * animDiscScale;       // diameter (radius side/6 * anim)
+      for (int k = 0; k < gm.fgWx.length; k++)
+        ellipse(gm.fgWx[k], gm.fgWy[k], fgD, fgD);
     }
   }
 }
@@ -328,17 +545,17 @@ void addTileShadow(Graphics2D sg, Tile t) {
   float off = shadowSize * gm.side / 3.0;
   AffineTransform oldT = sg.getTransform();
   sg.translate(off * cos(shadowAngle), off * sin(shadowAngle));
-  if (gm.conns.length > 0) {
+  if (gm.hasBands()) {
     Path2D.Float path = new Path2D.Float();
-    for (int[] c : gm.conns) appendConn(path, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
-    int cap = (gm.n == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-    sg.setStroke(new BasicStroke(gm.side / 3.0, cap, BasicStroke.JOIN_ROUND));
+    gm.appendBands(path);
+    int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+    sg.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
     sg.draw(path);
   }
-  if (winged && gm.n != 6) {                  // the fg nubs cast shadows too
-    float r = gm.side / 6.0;
-    for (int k = 0; k < gm.n; k++)
-      sg.fill(new Ellipse2D.Float(gm.mx[k] - r, gm.my[k] - r, 2 * r, 2 * r));
+  if (gm.wings) {                             // the fg nubs cast shadows too
+    float r = gm.side / 6.0 * animDiscScale;
+    for (int k = 0; k < gm.fgWx.length; k++)
+      sg.fill(new Ellipse2D.Float(gm.fgWx[k] - r, gm.fgWy[k] - r, 2 * r, 2 * r));
   }
   sg.setTransform(oldT);
 }
@@ -381,10 +598,10 @@ void drawExtrudeLevel(int d) {
   for (Tile lf : leaves) {
     if (lf.depth != d) continue;
     TileGeom gm = new TileGeom(lf);
-    for (int[] c : gm.conns) appendConn(bands, c[0], c[1], gm.n, gm.vx, gm.vy, gm.mx, gm.my);
-    if (winged && gm.n != 6) {                  // hex tiles have no nubs
-      float r = gm.side / 6.0;
-      for (int k = 0; k < gm.n; k++) nubs.add(new float[]{ gm.mx[k], gm.my[k], r });
+    gm.appendBands(bands);
+    if (gm.wings) {                             // hex tiles have no nubs
+      float r = gm.side / 6.0 * animDiscScale;
+      for (int k = 0; k < gm.fgWx.length; k++) nubs.add(new float[]{ gm.fgWx[k], gm.fgWy[k], r });
     }
     repSide = gm.side; repN = gm.n; any = true;
   }
@@ -394,7 +611,7 @@ void drawExtrudeLevel(int d) {
   int cap = (repN == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
 
   Graphics2D sg = beginExtrudeLayer();          // cleared, AA on, paint = side colour
-  sg.setStroke(new BasicStroke(repSide / 3.0, cap, BasicStroke.JOIN_ROUND));
+  sg.setStroke(new BasicStroke(repSide / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
   AffineTransform base = sg.getTransform();     // identity
 
   if (extrudeMode == 0) {                        // OBLIQUE: parallel translate toward the VP
@@ -463,17 +680,15 @@ boolean gradientStroke() { return colorScheme == 4 && gradPaint != null; }
 // shape: overlapping bands union cleanly, with no 1px seams or cusps where
 // separately-drawn strokes would meet (their AA edges otherwise leave hairline
 // gaps). Solid colour, or the canvas gradient paint in the gradient-smooth scheme.
-void drawTileBands(int[][] conns, int n,
-                   float[] vx, float[] vy, float[] mx, float[] my,
-                   float side, color fg) {
-  if (conns.length == 0) return;              // blank tile
+void drawTileBands(TileGeom gm, color fg) {
+  if (!gm.hasBands()) return;                 // blank tile
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
   Path2D.Float path = new Path2D.Float();
-  for (int[] c : conns) appendConn(path, c[0], c[1], n, vx, vy, mx, my);
+  gm.appendBands(path);
   // hexagon bands overlap across edges with a ROUND cap (no clip there); square/
-  // triangle end flush (CAP_BUTT) and rely on wings to bridge the shared edge.
-  int cap = (n == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-  g2.setStroke(new BasicStroke(side / 3.0, cap, BasicStroke.JOIN_ROUND));
+  // triangle/trapezoid end flush (CAP_BUTT) and rely on wings to bridge the edge.
+  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
   g2.draw(path);
 }
@@ -484,7 +699,7 @@ void drawTileBands(int[][] conns, int n,
 // the depth-0 pass, before finer (triangle) tiles draw on top.
 void strokeHexBatch() {
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  g2.setStroke(new BasicStroke(hexBatchSide / 3.0, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  g2.setStroke(new BasicStroke(hexBatchSide / 3.0 * animBandScale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(hexBatchFg));
   g2.draw(hexBatch);
 }
@@ -502,12 +717,13 @@ void appendConn(Path2D.Float path, int i, int j, int n,
   float[] c = lineIntersect(vx[i], vy[i], vx[(i + 1) % n], vy[(i + 1) % n],
                             vx[j], vy[j], vx[(j + 1) % n], vy[(j + 1) % n]);
   if (c == null) { path.moveTo(mx[i], my[i]); path.lineTo(mx[j], my[j]); return; }
-  float r  = dist(mx[i], my[i], c[0], c[1]);
+  float r  = dist(mx[i], my[i], c[0], c[1]) * animArcRadius;   // anim: grow/shrink radius
   float a0 = atan2(my[i] - c[1], mx[i] - c[0]);
   float a1 = atan2(my[j] - c[1], mx[j] - c[0]);
   float diff = a1 - a0;                        // shorter signed sweep -> interior arc
   while (diff <= -PI) diff += TWO_PI;
   while (diff > PI)  diff -= TWO_PI;
+  diff *= animArcSweep;                         // anim: grow/shrink sweep (both 1.0 when off)
   int seg = max(8, ceil(r * abs(diff) / 3.0));
   for (int k = 0; k <= seg; k++) {
     float ph = a0 + diff * k / seg;

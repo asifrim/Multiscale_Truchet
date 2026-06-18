@@ -206,6 +206,44 @@ class PaletteManager {
     add(fromHex("Vintage Modern",   new String[]{"8C2318","5E8C6A","88A65E","BFB35A","F2C45A"}));
     add(fromHex("Fresh Cut Day",    new String[]{"00A8C6","40C0CB","F9F2E7","AEE239","8FBE00"}));
     add(fromHex("Sea Side",         new String[]{"E5FCC2","9DE0AD","45ADA8","547980","594F4F"}));
+
+    // More of the all-time most-loved list. Hex verified against two independent
+    // verbatim dumps of the COLOURlovers top-100 (Experience-Monks/nice-color-
+    // palettes + federico-pepe/nice-color-palettes, which agree hex-for-hex);
+    // emoji/letter-spaced titles in the source were skipped.
+    add(fromHex("Compatible",          new String[]{"3FB8AF","7FC7AF","DAD8A7","FF9E9D","FF3D7F"}));
+    add(fromHex("LoversInJapan",       new String[]{"E94E77","D68189","C6A49A","C6E5D9","F4EAD5"}));
+    add(fromHex("Good Friends",        new String[]{"D9CEB2","948C75","D5DED9","7A6A53","99B2B7"}));
+    add(fromHex("dream magnet",        new String[]{"343838","005F6B","008C9E","00B4CC","00DFFC"}));
+    add(fromHex("clairedelune",        new String[]{"413E4A","73626E","B38184","F0B49E","F7E4BE"}));
+    add(fromHex("coup de grace",       new String[]{"99B898","FECEA8","FF847C","E84A5F","2A363B"}));
+    add(fromHex("Dance To Forget",     new String[]{"FF4E50","FC913A","F9D423","EDE574","E1F5C4"}));
+    add(fromHex("mystery machine",     new String[]{"554236","F77825","D3CE3D","F1EFA5","60B99A"}));
+    add(fromHex("you are beautiful",   new String[]{"351330","424254","64908A","E8CAA4","CC2A41"}));
+    add(fromHex("Wasabi Suicide",      new String[]{"FF4242","F4FAD2","D4EE5E","E1EDB9","F0F2EB"}));
+    add(fromHex("Headache",            new String[]{"655643","80BCA3","F6F7BD","E6AC27","BF4D28"}));
+    add(fromHex("Maddening Caravan",   new String[]{"FAD089","FF9C5B","F5634A","ED303C","3B8183"}));
+    add(fromHex("Storming Psychedelia",new String[]{"BCBDAC","CFBE27","F27435","F02475","3B2D38"}));
+    add(fromHex("tech light",          new String[]{"D1E751","FFFFFF","000000","4DBCE9","26ADE4"}));
+    add(fromHex("forever lost",        new String[]{"5D4157","838689","A8CABA","CAD7B2","EBE3AA"}));
+    add(fromHex("Papua New Guinea",    new String[]{"5E412F","FCEBB6","78C0A8","F07818","F0A830"}));
+    add(fromHex("Newly Risen Moon",    new String[]{"EEE6AB","C5BC8E","696758","45484B","36393B"}));
+    add(fromHex("A Dream in Color",    new String[]{"1B676B","519548","88C425","BEF202","EAFDE6"}));
+    add(fromHex("1001 Stories",        new String[]{"F8B195","F67280","C06C84","6C5B7B","355C7D"}));
+    add(fromHex("Lena's Love Letter",  new String[]{"F04155","FF823A","F2F26F","FFF7BD","95CFB7"}));
+    add(fromHex("Koi Carp",            new String[]{"F0D8A8","3D1C00","86B8B1","F2D694","FA2A00"}));
+    add(fromHex("Hymn For My Soul",    new String[]{"2A044A","0B2E59","0D6759","7AB317","A0C55F"}));
+    add(fromHex("lucky bubble gum",    new String[]{"67917A","170409","B8AF03","CCBF82","E33258"}));
+    add(fromHex("Entrapped InAPalette",new String[]{"B9D7D9","668284","2A2829","493736","7B3B3B"}));
+    add(fromHex("Very",                new String[]{"BBBB88","CCC68D","EEDD99","EEC290","EEAA88"}));
+    add(fromHex("it's raining love",   new String[]{"A3A948","EDB92E","F85931","CE1836","009989"}));
+    add(fromHex("Funny Like the Moon", new String[]{"E8D5B7","0E2430","FC3A51","F5B349","E8D5B9"}));
+    add(fromHex("I like your Smile",   new String[]{"B3CC57","ECF081","FFBE40","EF746F","AB3E5B"}));
+    add(fromHex("Thumbelina",          new String[]{"AB526B","BCA297","C5CEAE","F0E2A4","F4EBC3"}));
+    add(fromHex("Machu Picchu",        new String[]{"607848","789048","C0D860","F0F0D8","604848"}));
+    add(fromHex("Influenza",           new String[]{"300030","480048","601848","C04848","F07241"}));
+    add(fromHex("The Way You Love Me", new String[]{"1C2130","028F76","B3E099","FFEAAD","D14334"}));
+    add(fromHex("Miaka",               new String[]{"FC354C","29221F","13747D","0ABFBC","FCF7C5"}));
     current = 0;
   }
 }

@@ -48,11 +48,14 @@
 //
 //  Shapes (see Shapes.pde): square (multi-scale quadtree), triangle
 //  (multi-scale rep-tile), hexagon (multi-scale -- a hexagon is not a rep-tile,
-//  so it subdivides into 6 equilateral triangles that then recurse). Keys 4/3/6.
+//  so it subdivides into 6 equilateral triangles that then recurse), and
+//  trapezoid (half-hexagon, rep-4 subdivision; long edge carries two ports).
+//  Keys 4/3/6/t.
 //
-//  Controls:  SPACE = new pattern  |  4/3/6 = square/triangle/hexagon
+//  Controls:  SPACE = new pattern  |  4/3/6/t = square/triangle/hexagon/trapezoid
 //             P/p = prev/next palette  |  R = rotate palette  |  C = colour
-//             scheme  |  M = symmetry (pixel mirror / rot 180 / tile mirror)  |  S = save PNG
+//             scheme  |  M = symmetry (pixel mirror / rot 180 / tile mirror)
+//             g = grid overlay  |  S = save PNG
 // ============================================================
 
 // Edges, clockwise:  0 = N (top), 1 = E (right), 2 = S (bottom), 3 = W (left)
@@ -73,6 +76,7 @@ boolean shadowGlobal  = false;  // false = per-level mask (finer bg occludes coa
 int     colorScheme   = 0;      // 0 = duotone, 1 = multi, 2 = gradient (see schemeName)
 int     symmetryMode  = 0;      // 0 = none, 1-3 = pixel mirrors (V/H/both), 4 = rot 180 (tile), 5-7 = tile mirrors (V/H/quad)
 String[] SYMMETRY_NAMES = { "none", "vertical", "horizontal", "quad", "rot 180", "tile mir V", "tile mir H", "tile mir quad" };
+boolean showGrid      = false;  // overlay the base (root) tile lattice on top of the render
 
 // 3D extrusion (graffiti block depth): the foreground ribbons get solid sides
 // extruded toward a vanishing point, viewed head-on. See draw()/drawExtrudeLevel.
@@ -83,6 +87,22 @@ float   vpX           = 0.5;    // vanishing point, normalised canvas coords (ma
 float   vpY           = -0.2;   // default just above the top edge
 float   extrudeDepth  = 0.5;    // depth as a fraction of each level's tile side
 float   extrudeShade  = 0.55;   // side-wall darkness: 0 = ribbon colour, 1 = black
+
+// Image mode (Truchet halftone): render an image as a mosaic of multi-scale
+// Truchet patches chosen by brightness. See ImageMode.pde.
+boolean imageMode     = false;  // master toggle (TRUCHET_IMG / Controls)
+String  imagePath     = null;   // source image file
+PImage  sourceImg     = null;   // loaded source (lazy, in drawImageMode)
+int     imgCols       = 48;     // mosaic columns (rows derived from aspect); = gridN in image mode
+int     libSize       = 256;    // number of candidate patches measured for the brightness library
+float   imgGamma      = 1.0;    // gamma applied to sampled cell brightness (>1 darkens midtones)
+boolean imgStretch    = true;   // map image brightness across the library's full achievable range
+boolean imgInvert     = false;  // invert the brightness->patch mapping (dark image -> bright patch)
+boolean imgContain    = true;   // true = fit whole image (pad with bright bg); false = cover/crop
+boolean imgDirty      = true;   // rebuild the library + mosaic when image/params change
+int[]   libSeed;                // per-patch RNG seed
+float[] libSubdiv;              // per-patch subdivide probability (sweeps density -> brightness range)
+float[] libBright;             // per-patch measured mean luminance (0..255), parallel to libSeed
 
 // gradient scheme state (recomputed per draw; see setupGradient)
 color   gradSolid;              // the one solid colour (tile background)
@@ -95,6 +115,12 @@ ControlWindow  controls;        // parameter GUI window (see ControlWindow.pde),
 TileWindow     tilesWin;        // per-shape tile-weight editor (see TileWindow.pde), set in setup()
 boolean saveRequested = false;  // set by the control window's Save button, handled in draw()
 String  autosavePath  = null;   // TRUCHET_OUT env var: render once to this file, then exit
+
+// Layout caching: the tile list + gradient are deterministic from seed/params, so
+// they're rebuilt only when one of those changes (set dirty by the mutators) --
+// not every animated frame. (Animation engine lives in Animation.pde.)
+boolean dirtyLayout   = true;
+boolean dirtyGradient = true;
 
 // ---- tile alphabet ----------------------------------------------
 // The n=4 instance of Steele's sideConnectionSets: every non-crossing
@@ -114,10 +140,35 @@ float[] TILE_W = { 0.4, 1.0, 1.0, 6.0, 2.0 };
 ArrayList<Tile> leaves;
 
 // ---- setup / draw ----------------------------------------------
-void setup() {
-  size(1920, 1080);
+// Canvas size lives in settings() (Processing requires size()/smooth() there
+// when driven by variables). Defaults to 1920x1080; the whole tiling is
+// resolution-independent (every length derives from width/height), so a larger
+// canvas yields the SAME composition at higher resolution -- ideal for a
+// print/wallpaper export. Override for a high-res render via env vars:
+//   TRUCHET_W / TRUCHET_H  -- explicit canvas pixels, or
+//   TRUCHET_SCALE          -- multiply the 1920x1080 default (e.g. 2 -> 4K, 4 -> 8K).
+// This also enlarges the interactive window (window == canvas in Processing), so
+// for a "small window, big PNG" export use the headless path (TRUCHET_OUT), which
+// opens no window at all. Big sizes cost memory: the shadow/extrude layers are
+// width*height*4 bytes each (~133 MB apiece at 8K).
+void settings() {
+  int w = 1920, h = 1080;
+  String envW = System.getenv("TRUCHET_W");
+  if (envW != null) w = max(16, Integer.parseInt(envW.trim()));
+  String envH = System.getenv("TRUCHET_H");
+  if (envH != null) h = max(16, Integer.parseInt(envH.trim()));
+  String envScale = System.getenv("TRUCHET_SCALE");
+  if (envScale != null) {
+    float s = max(0.05, Float.parseFloat(envScale.trim()));
+    w = round(w * s); h = round(h * s);
+  }
+  size(w, h);
   smooth(8);
+}
+
+void setup() {
   palettes = new PaletteManager();   // built-in COLOURlovers snapshot
+  initAnim();                        // animation engine (LFOs, registry) — see Animation.pde
   noLoop();
 
   // Headless one-shot render (for verifying changes from the command line —
@@ -126,14 +177,18 @@ void setup() {
   // to TRUCHET_OUT and the sketch exits. Example:
   //   TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 processing-java --sketch=... --run
   autosavePath = System.getenv("TRUCHET_OUT");
-  String envShape  = System.getenv("TRUCHET_SHAPE");   // 0 square, 1 triangle, 2 hexagon
-  if (envShape != null)  shapeMode   = constrain(Integer.parseInt(envShape.trim()), 0, 2);
+  String envShape  = System.getenv("TRUCHET_SHAPE");   // 0 square, 1 triangle, 2 hexagon, 3 trapezoid
+  if (envShape != null)  shapeMode   = constrain(Integer.parseInt(envShape.trim()), 0, 3);
   String envScheme = System.getenv("TRUCHET_SCHEME");  // 0..4, see schemeName()
   if (envScheme != null) colorScheme = constrain(Integer.parseInt(envScheme.trim()), 0, 4);
   String envSeed   = System.getenv("TRUCHET_SEED");
   if (envSeed != null)   seedVal     = Integer.parseInt(envSeed.trim());
+  String envPal    = System.getenv("TRUCHET_PALETTE"); // palette index (wraps; see loadDefaults)
+  if (envPal != null)    palettes.setCurrent(Integer.parseInt(envPal.trim()));
   String envSym    = System.getenv("TRUCHET_SYM");     // 0..4, see SYMMETRY_NAMES
   if (envSym != null)    symmetryMode = constrain(Integer.parseInt(envSym.trim()), 0, SYMMETRY_NAMES.length - 1);
+  String envSG     = System.getenv("TRUCHET_SHOWGRID");  // 0/1: overlay the base tile grid
+  if (envSG != null)     showGrid    = !envSG.trim().equals("0");
   String envShadow = System.getenv("TRUCHET_SHADOW");  // 0/1: drop shadow off/on
   if (envShadow != null) dropShadow  = !envShadow.trim().equals("0");
   String envShStr  = System.getenv("TRUCHET_SHADOW_STR");  // shadow darkness 0..1
@@ -148,6 +203,8 @@ void setup() {
   if (envGrid != null)   gridN       = constrain(Integer.parseInt(envGrid.trim()), 2, 16);
   String envDepth  = System.getenv("TRUCHET_DEPTH");   // max subdivisions (0 = single scale)
   if (envDepth != null)  maxDepth    = constrain(Integer.parseInt(envDepth.trim()), 0, 6);
+  String envSub    = System.getenv("TRUCHET_SUBDIV");  // subdivide probability (0..1; 1 = uniform fine)
+  if (envSub != null)    subdivideProb = constrain(Float.parseFloat(envSub.trim()), 0, 1);
   String envEx     = System.getenv("TRUCHET_EXTRUDE");      // 0/1: 3D extrusion off/on
   if (envEx != null)     extrude3D   = !envEx.trim().equals("0");
   String envExMode = System.getenv("TRUCHET_EXTRUDE_MODE"); // 0 oblique, 1 one-point
@@ -160,6 +217,40 @@ void setup() {
   if (envExD != null)    extrudeDepth = Float.parseFloat(envExD.trim());
   String envExS    = System.getenv("TRUCHET_EXTRUDE_SHADE"); // side darkness 0..1
   if (envExS != null)    extrudeShade = constrain(Float.parseFloat(envExS.trim()), 0, 1);
+  // --- animation (headless verification of motion) ---
+  String envARate  = System.getenv("TRUCHET_ANIM_RATE");   // master LFO rate (Hz)
+  if (envARate != null)  applyAnimRate(Float.parseFloat(envARate.trim()));
+  String envADep   = System.getenv("TRUCHET_ANIM_DEPTH");  // set ALL LFO depths (show motion)
+  if (envADep != null) {
+    float dep = constrain(Float.parseFloat(envADep.trim()), 0, 1);
+    lfoBand.depth = lfoDisc.depth = lfoRot.depth = lfoSweep.depth = lfoRadius.depth = dep;
+  }
+  String envAT     = System.getenv("TRUCHET_ANIM_T");      // LFO-driven frame at this time (s)
+  if (envAT != null) { animSeconds = Float.parseFloat(envAT.trim()); headlessAnimOverride = true; animEnabled = true; animSource = 0; }
+  String envA      = System.getenv("TRUCHET_ANIM");        // fixed registry values "name=v01,..."
+  if (envA != null) {                                       // deterministic, bypasses LFOs
+    headlessAnimOverride = true; animSource = 1;
+    for (String pair : envA.trim().split(",")) {
+      String[] kv = pair.split("=");
+      if (kv.length == 2) setAnimValue(kv[0].trim(), Float.parseFloat(kv[1].trim()));
+    }
+  }
+  // --- image mode (Truchet halftone of a source image) ---
+  String envImg = System.getenv("TRUCHET_IMG");          // path -> enable image mode
+  if (envImg != null && envImg.trim().length() > 0) { imagePath = envImg.trim(); imageMode = true; }
+  String envImgCols = System.getenv("TRUCHET_IMG_COLS"); // mosaic columns
+  if (envImgCols != null) imgCols = max(1, Integer.parseInt(envImgCols.trim()));
+  String envImgLib  = System.getenv("TRUCHET_IMG_LIB");  // brightness-library size
+  if (envImgLib != null)  libSize = max(2, Integer.parseInt(envImgLib.trim()));
+  String envImgGam  = System.getenv("TRUCHET_IMG_GAMMA");
+  if (envImgGam != null)  imgGamma = max(0.01, Float.parseFloat(envImgGam.trim()));
+  String envImgStr  = System.getenv("TRUCHET_IMG_STRETCH"); // 0/1: histogram-stretch to library range
+  if (envImgStr != null)  imgStretch = !envImgStr.trim().equals("0");
+  String envImgInv  = System.getenv("TRUCHET_IMG_INVERT");  // 0/1: invert brightness mapping
+  if (envImgInv != null)  imgInvert = !envImgInv.trim().equals("0");
+  String envImgFit  = System.getenv("TRUCHET_IMG_CONTAIN"); // 0 = cover/crop, 1 = contain (fit whole)
+  if (envImgFit != null)  imgContain = !envImgFit.trim().equals("0");
+
   if (autosavePath != null) {
     saveRequested = false;             // headless writes only TRUCHET_OUT
     return;                            // no GUI windows in headless mode
@@ -174,42 +265,68 @@ void setup() {
 }
 
 void draw() {
-  randomSeed(seedVal);
-  setupGradient();                // pick the gradient scheme's colours (may use random)
-  randomSeed(seedVal);            // reset so the tile layout is the same across schemes
+  // 0. animation: advance the clock + refresh the modulator snapshot the render
+  //    reads (identity when animation is off, so a static frame is unchanged).
+  updateAnim();
+
+  // gradient + layout are deterministic from seed/params -> rebuild only when a
+  // mutator marked them dirty, not every animated frame.
+  if (dirtyGradient) {
+    randomSeed(seedVal);
+    setupGradient();              // pick the gradient scheme's colours (uses random)
+    dirtyGradient = false;
+  }
   // Defensive: clear any polygon clip a previous frame may have left set (see
   // pushPolyClip in Shapes.pde) before we clear and redraw the canvas.
   ((PGraphicsJava2D) g).g2.setClip(null);
-  if (colorScheme == 3) drawGradientBackground();   // smooth gradient fills the canvas
-  else background(canvasBgColor());
 
-  // 1. build the top-level tiling for the active shape, then subdivide
-  //    (square + triangle) collecting leaf tiles. (See Shapes.pde.)
-  //    The tile-level symmetries are structural: rot 180 (mode 4) generates
-  //    only the rows above the rotation centre and adds a half-turn twin per
-  //    leaf; tile mirrors (modes 5-7) generate the fundamental domain (half or
-  //    quadrant) plus the on-axis straddlers (mirror-aware) and add a flipped/
-  //    rotated twin per leaf to fill the rest (see collectSym/addSymTwins).
-  leaves = new ArrayList<Tile>();
-  boolean rot180 = (symmetryMode == 4);
-  boolean vMir   = (symmetryMode == 5 || symmetryMode == 7);
-  boolean hMir   = (symmetryMode == 6 || symmetryMode == 7);
-  float rotYc = rot180 ? rotCentreY() : 0;
-  for (Tile t : buildRoots()) {
-    if (rot180 && t.cy >= rotYc) continue;     // half-turn twins fill the rest
-    if (vMir || hMir) { collectSym(t, vMir, hMir); continue; }
-    collectTile(t);
+  // IMAGE MODE (TRUCHET_IMG / Controls): render the active image as a mosaic of
+  // multi-scale Truchet patches chosen by brightness. Self-contained -- it clears
+  // the canvas, builds its own leaves and draws them (see ImageMode.pde) -- so it
+  // replaces the normal background + build + render + symmetry block below.
+  if (imageMode) {
+    drawImageMode();
+  } else {
+    if (colorScheme == 3) drawGradientBackground();   // smooth gradient fills the canvas
+    else background(canvasBgColor());
+
+    // 1. build the leaf tiling (cached; see rebuildLeaves).
+    if (dirtyLayout) { rebuildLeaves(); dirtyLayout = false; }
+
+    // 2. draw the tiling coarse-first (see renderTiling).
+    renderTiling();
+
+    // 3. mirror symmetry (modes 1-3): reflect the rendered pixels about
+    //    grid-aligned axes. (Mode 4, rot 180, is tile-level -- see step 1.)
+    applySymmetry();
+
+    // 3b. optional: overlay the base (root) tile lattice on top of everything.
+    if (showGrid) drawGridOverlay();
   }
-  if (rot180)        addRotatedTwins();
-  if (vMir || hMir)  addSymTwins(vMir, hMir);
 
-  // 2. draw coarse-first so finer tiles + wings land on top. Each depth level
-  //    renders in three passes -- all backgrounds, then ONE unioned shadow
-  //    layer, then all foregrounds (see Shapes.pde) -- so every shadow falls
-  //    across every same-level background yet stays beneath every same-level
-  //    band, keeping a single consistent light direction. Whole hexagons (all
-  //    depth 0) accumulate their bands and are stroked once, as a single
-  //    antialiased shape -- no seams between their overlapping bands.
+  // 4. honour a save request from the control window (run here, on the
+  // viz thread, so the saved frame is the fully drawn one).
+  if (saveRequested) {
+    saveFrame("truchet-####.png");
+    saveRequested = false;
+  }
+
+  // 5. headless mode (TRUCHET_OUT): save the rendered frame and quit.
+  if (autosavePath != null) {
+    save(autosavePath);
+    exit();
+  }
+}
+
+// Draw the global `leaves` coarse-first so finer tiles + wings land on top. Each
+// depth level renders in three passes -- all backgrounds, then ONE unioned shadow
+// layer, then all foregrounds (see Shapes.pde) -- so every shadow falls across
+// every same-level background yet stays beneath every same-level band, keeping a
+// single consistent light direction. Whole hexagons (all depth 0) accumulate
+// their bands and are stroked once, as a single antialiased shape -- no seams
+// between their overlapping bands. Factored out of draw() so image mode can reuse
+// it for both the calibration rounds and the final mosaic.
+void renderTiling() {
   hexBatch = new Path2D.Float();
   hexBatchUsed = false;
   if (extrude3D) {
@@ -267,23 +384,57 @@ void draw() {
       if (d == 0 && hexBatchUsed) strokeHexBatch();
     }
   }
+}
 
-  // 3. mirror symmetry (modes 1-3): reflect the rendered pixels about
-  //    grid-aligned axes. (Mode 4, rot 180, is tile-level -- see step 1.)
-  applySymmetry();
-
-  // 4. honour a save request from the control window (run here, on the
-  // viz thread, so the saved frame is the fully drawn one).
-  if (saveRequested) {
-    saveFrame("truchet-####.png");
-    saveRequested = false;
+// Overlay the base (root-level) tile lattice on top of the finished render -- a
+// visual aid for reading the grid the tiling subdivides from. Independent of the
+// drawn leaves (and of the symmetry filtering applied to them): it re-derives the
+// full-canvas root tessellation from buildRoots() and strokes each tile's
+// outline, so it covers the whole canvas in every symmetry mode. Drawn in a thin
+// translucent line whose weight scales with the canvas so it stays ~1px at any
+// export resolution. Not shown in image mode (that mosaic uses its own cell grid).
+void drawGridOverlay() {
+  ((PGraphicsJava2D) g).g2.setClip(null);    // clear any leftover tile clip
+  pushStyle();
+  noFill();
+  stroke(255, 0, 80, 200);                   // contrasting pink-red, reads on light or dark
+  strokeWeight(max(1.0, width / 1600.0));
+  strokeJoin(MITER);
+  for (Tile t : buildRoots()) {
+    TileGeom gm = new TileGeom(t);            // gm.vx/vy = this root's polygon outline
+    beginShape();
+    for (int k = 0; k < gm.vx.length; k++) vertex(gm.vx[k], gm.vy[k]);
+    endShape(CLOSE);
   }
+  popStyle();
+}
 
-  // 5. headless mode (TRUCHET_OUT): save the rendered frame and quit.
-  if (autosavePath != null) {
-    save(autosavePath);
-    exit();
+// Build the leaf tiling for the active shape + seed into the global `leaves`.
+// Deterministic from seedVal/gridN/maxDepth/subdivideProb/shapeMode/symmetryMode,
+// so it's cached across animated frames and only re-run when one of those changes.
+// The tile-level symmetries are structural: rot 180 (mode 4) generates only the
+// rows above the rotation centre and adds a half-turn twin per leaf; tile mirrors
+// (modes 5-7) generate the fundamental domain (half or quadrant) plus the on-axis
+// straddlers (mirror-aware) and add a flipped/rotated twin per leaf to fill the
+// rest (see collectSym/addSymTwins).
+void rebuildLeaves() {
+  randomSeed(seedVal);             // reseed so motif rolls match the seed exactly
+  leaves = new ArrayList<Tile>();
+  // The structural (tile-level) symmetry modes 4-7 rely on grid-specific
+  // rotation centres / mirror lines defined only for square/triangle/hexagon, so
+  // the trapezoid ignores them (collects normally); the post-render pixel mirror
+  // modes 1-3 still apply to it in applySymmetry().
+  boolean rot180 = (symmetryMode == 4) && shapeMode != 3;
+  boolean vMir   = (symmetryMode == 5 || symmetryMode == 7) && shapeMode != 3;
+  boolean hMir   = (symmetryMode == 6 || symmetryMode == 7) && shapeMode != 3;
+  float rotYc = rot180 ? rotCentreY() : 0;
+  for (Tile t : buildRoots()) {
+    if (rot180 && t.cy >= rotYc) continue;     // half-turn twins fill the rest
+    if (vMir || hMir) { collectSym(t, vMir, hMir); continue; }
+    collectTile(t);
   }
+  if (rot180)        addRotatedTwins();
+  if (vMir || hMir)  addSymTwins(vMir, hMir);
 }
 
 // Recursively subdivide a tile (per its shape) or record it as a leaf.
@@ -291,8 +442,11 @@ void collectTile(Tile t) {
   if (canSubdivide(t) && random(1) < subdivideProb) {
     for (Tile c : children(t)) collectTile(c);
   } else {
-    t.mi = pickWeighted(weightsFor(t.n));   // fix the motif at collection time so
-    t.mk = int(random(t.n));                // a rot-180 twin can reuse it verbatim
+    // fix the motif at collection time so a rot-180 twin can reuse it verbatim.
+    // The trapezoid is not rotationally symmetric, so it carries no motif spin
+    // (mk = 0) and draws from its own alphabet (TRAP_CONNS/TRAP_W).
+    t.mi = pickWeighted(t.trap ? TRAP_W : weightsFor(t.n));
+    t.mk = t.trap ? 0 : int(random(t.n));
     leaves.add(t);
   }
 }
@@ -683,27 +837,36 @@ color ribbonColor(Palette p, int depth) {
 void keyPressed() {
   if (key == ' ') {
     seedVal = int(random(1, 99999));
+    dirtyLayout = true; dirtyGradient = true;
     redraw();
   } else if (key == 's' || key == 'S') {
     saveFrame("truchet-####.png");
+  } else if (key == 'a' || key == 'A') {   // toggle animation
+    setAnimEnabled(!animEnabled);
+    println("animation: " + animEnabled);
   } else if (key == 'p') {                 // next palette
     palettes.next();
     println("palette: " + palettes.current());
+    dirtyGradient = true;
     redraw();
   } else if (key == 'P') {                 // previous palette
     palettes.prev();
     println("palette: " + palettes.current());
+    dirtyGradient = true;
     redraw();
   } else if (key == 'c' || key == 'C') {   // cycle colour scheme
     colorScheme = (colorScheme + 1) % 5;
     println("colour scheme: " + schemeName(colorScheme));
+    dirtyGradient = true;
     redraw();
   } else if (key == 'r' || key == 'R') {   // rotate the palette's colours
     palettes.current().rotate();
+    dirtyGradient = true;
     redraw();
   } else if (key == 'm' || key == 'M') {   // cycle symmetry (mirrors, then rot 180)
     symmetryMode = (symmetryMode + 1) % SYMMETRY_NAMES.length;
     println("symmetry: " + SYMMETRY_NAMES[symmetryMode]);
+    dirtyLayout = true;
     redraw();
   } else if (key == 'e') {                 // toggle 3D extrusion
     extrude3D = !extrude3D;
@@ -719,11 +882,18 @@ void keyPressed() {
     setShape(1);
   } else if (key == '6') {                 // hexagon
     setShape(2);
+  } else if (key == 't' || key == 'T') {   // trapezoid (half-hexagon)
+    setShape(3);
+  } else if (key == 'g' || key == 'G') {   // toggle base-grid overlay
+    showGrid = !showGrid;
+    println("grid overlay: " + showGrid);
+    redraw();
   }
 }
 
 void setShape(int mode) {
   shapeMode = mode;
   println("shape: " + SHAPE_NAMES[shapeMode]);
+  dirtyLayout = true;
   redraw();
 }

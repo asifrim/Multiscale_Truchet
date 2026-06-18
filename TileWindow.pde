@@ -26,7 +26,7 @@ public class TileWindow extends PApplet {
 
   TileWindow(Multiscale_Truchet parent) { this.parent = parent; }
 
-  public void settings() { size(380, 600); }
+  public void settings() { size(380, 780); }   // tall enough for the trapezoid's 8 archetypes
 
   public void setup() {
     surface.setTitle("Truchet — Tiles");
@@ -36,9 +36,10 @@ public class TileWindow extends PApplet {
 
   public void draw() {
     background(38);
+    boolean isTrap = parent.shapeMode == 3;
     int     n    = parent.SHAPE_N[parent.shapeMode];
-    int[][][] arch = parent.connsFor(n);
-    float[] w    = parent.weightsFor(n);
+    int[][][] arch = isTrap ? parent.TRAP_CONNS : parent.connsFor(n);
+    float[] w    = isTrap ? parent.TRAP_W       : parent.weightsFor(n);
 
     textAlign(LEFT, CENTER);
     fill(235); textSize(15);
@@ -48,7 +49,8 @@ public class TileWindow extends PApplet {
 
     for (int i = 0; i < arch.length; i++) {
       float cy = y0 + i * rowH;
-      drawArchetype(arch[i], n, margin + tileSz / 2.0, cy, tileSz);
+      if (isTrap) drawTrapArchetype(arch[i], margin + tileSz / 2.0, cy, tileSz);
+      else        drawArchetype(arch[i], n, margin + tileSz / 2.0, cy, tileSz);
 
       // weight slider
       stroke(90); strokeWeight(3);
@@ -117,9 +119,49 @@ public class TileWindow extends PApplet {
     endShape(CLOSE);
   }
 
+  // Draw one trapezoid archetype: the canonical half-hexagon (see Shapes.pde),
+  // its bands sampled from parent.trapArcSpec, plus the foreground port nubs so
+  // the unmatched-port caps read. Canonical y is up, so y is flipped here.
+  void drawTrapArchetype(int[][] conns, float ccx, float ccy, float sz) {
+    float H = parent.TRAP_H;
+    float scale = sz / 2.4;                          // canonical width 2 fits in sz
+    // tile background
+    noStroke(); fill(230);
+    beginShape();
+    for (float[] v : parent.TRAP_V) vertex(ccx + (v[0] - 1) * scale, ccy - (v[1] - H / 2) * scale);
+    endShape(CLOSE);
+
+    // bands (centre-lines stroked at width scale/3, sampled from the arc specs)
+    stroke(35); strokeWeight(scale / 3.0); strokeCap(SQUARE); noFill();
+    for (int[] c : conns) {
+      float[] sp = parent.trapArcSpec(c[0], c[1]);
+      float r = sp[2], a0 = radians(sp[3]), a1 = radians(sp[4]);
+      int seg = max(8, (int) (r * scale * abs(a1 - a0) / 3.0));
+      beginShape();
+      for (int k = 0; k <= seg; k++) {
+        float ph = a0 + (a1 - a0) * k / seg;
+        float zx = sp[0] + r * cos(ph), zy = sp[1] + r * sin(ph);
+        vertex(ccx + (zx - 1) * scale, ccy - (zy - H / 2) * scale);
+      }
+      endShape();
+    }
+
+    // foreground port nubs (radius scale/6)
+    noStroke(); fill(35);
+    float d = scale / 3.0;
+    for (float[] p : parent.TRAP_PORT) ellipse(ccx + (p[0] - 1) * scale, ccy - (p[1] - H / 2) * scale, d, d);
+
+    // faint tile outline
+    noFill(); stroke(95); strokeWeight(1);
+    beginShape();
+    for (float[] v : parent.TRAP_V) vertex(ccx + (v[0] - 1) * scale, ccy - (v[1] - H / 2) * scale);
+    endShape(CLOSE);
+  }
+
   // ---- interaction ----
   public void mousePressed() {
-    int rows = parent.connsFor(parent.SHAPE_N[parent.shapeMode]).length;
+    int rows = (parent.shapeMode == 3 ? parent.TRAP_CONNS
+                                      : parent.connsFor(parent.SHAPE_N[parent.shapeMode])).length;
     for (int i = 0; i < rows; i++) {
       float cy = y0 + i * rowH;
       if (abs(mouseY - cy) < 18 && mouseX > trackX0 - 18 && mouseX < trackX1 + 18) {
@@ -135,7 +177,10 @@ public class TileWindow extends PApplet {
 
   void setWeight(int i) {
     float t = constrain((mouseX - trackX0) / (trackX1 - trackX0), 0, 1);
-    parent.weightsFor(parent.SHAPE_N[parent.shapeMode])[i] = t * WMAX;
+    float[] w = (parent.shapeMode == 3) ? parent.TRAP_W
+                                        : parent.weightsFor(parent.SHAPE_N[parent.shapeMode]);
+    w[i] = t * WMAX;
+    parent.dirtyLayout = true;   // weights drive the motif roll in collectTile -> rebuild
     parent.redraw();
   }
 }

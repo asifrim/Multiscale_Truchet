@@ -22,67 +22,93 @@ public class ControlWindow extends PApplet {
   Multiscale_Truchet parent;
 
   final int margin = 18;
-  final int rowH   = 50;
-  float trackX0, trackX1;
+  final int rowH   = 46;
+  final int gap    = 24;                          // gap between the two columns
+  final int W      = 680;                          // window width (double the old 340)
+  final int colW   = (W - 2 * margin - gap) / 2;   // content width of one column
+  final int colLX  = margin;                       // left column origin x
+  final int colRX  = margin + colW + gap;          // right column origin x
 
   ArrayList<Slider> sliders = new ArrayList<Slider>();
-  Toggle tgWinged, tgInvert, tgShadow, tgShadowGlobal, tgExtrude;
-  Button bShape, bScheme, bSym, bExtrude, bPrev, bNext, bRot, bSeed, bSave;
+  Toggle tgWinged, tgInvert, tgShadow, tgShadowGlobal, tgExtrude, tgAnim, tgGrid;
+  Toggle tgImage, tgImgStretch, tgImgInvert, tgImgContain;
+  Button bShape, bScheme, bSym, bExtrude, bPrev, bNext, bRot, bSeed, bSave, bImgLoad;
   Slider active = null;
+  int imgLabelY;
 
   int palLabelY, swatchY, swatchH;
 
   ControlWindow(Multiscale_Truchet parent) { this.parent = parent; }
 
-  public void settings() { size(340, 1000); }
+  public void settings() { size(W, 856); }
 
   public void setup() {
     surface.setTitle("Truchet — Controls");
-    trackX0 = 150;
-    trackX1 = width - margin;
 
+    // The sliders ArrayList order is read by index in syncParent(), so the 18
+    // sliders MUST be added in this order: 0-9 (left column), then 10-17 (right
+    // column). Layout x/y differs per column but does not affect the indices.
+
+    // ===== LEFT COLUMN: geometry, shadow, 3D extrusion =====
     int y = 56;
-    sliders.add(new Slider("grid",        y, 2, 12, parent.gridN,         true));  y += rowH;
-    sliders.add(new Slider("max depth",   y, 1, 6,  parent.maxDepth,      true));  y += rowH;
-    sliders.add(new Slider("subdiv prob", y, 0, 1,  parent.subdivideProb, false)); y += rowH;
-    sliders.add(new Slider("shadow angle", y, 0, 360, degrees(parent.shadowAngle), true)); y += rowH;
-    sliders.add(new Slider("shadow size", y, 0, 1,  parent.shadowSize,    false)); y += rowH;
-    sliders.add(new Slider("shadow strength", y, 0, 1, parent.shadowStrength, false)); y += rowH;
-    sliders.add(new Slider("vp x",          y, 0,    1,   parent.vpX,          false)); y += rowH;
-    sliders.add(new Slider("vp y",          y, -0.5, 1.5, parent.vpY,          false)); y += rowH;
-    sliders.add(new Slider("extrude depth", y, 0,    1,   parent.extrudeDepth, false)); y += rowH;
-    sliders.add(new Slider("extrude shade", y, 0,    1,   parent.extrudeShade, false)); y += rowH + 4;
+    sliders.add(new Slider("grid",        colLX, y, 2, 12, parent.gridN,         true));  y += rowH;  // 0
+    sliders.add(new Slider("max depth",   colLX, y, 1, 6,  parent.maxDepth,      true));  y += rowH;  // 1
+    sliders.add(new Slider("subdiv prob", colLX, y, 0, 1,  parent.subdivideProb, false)); y += rowH;  // 2
+    sliders.add(new Slider("shadow angle", colLX, y, 0, 360, degrees(parent.shadowAngle), true)); y += rowH;  // 3
+    sliders.add(new Slider("shadow size", colLX, y, 0, 1,  parent.shadowSize,    false)); y += rowH;  // 4
+    sliders.add(new Slider("shadow strength", colLX, y, 0, 1, parent.shadowStrength, false)); y += rowH;  // 5
+    sliders.add(new Slider("vp x",          colLX, y, 0,    1,   parent.vpX,          false)); y += rowH;  // 6
+    sliders.add(new Slider("vp y",          colLX, y, -0.5, 1.5, parent.vpY,          false)); y += rowH;  // 7
+    sliders.add(new Slider("extrude depth", colLX, y, 0,    1,   parent.extrudeDepth, false)); y += rowH;  // 8
+    sliders.add(new Slider("extrude shade", colLX, y, 0,    1,   parent.extrudeShade, false)); y += rowH + 4;  // 9
 
-    tgWinged = new Toggle("winged",       margin,       y, parent.winged);
-    tgInvert = new Toggle("invert/level", margin + 160, y, parent.invertPerLevel);
-    y += 40;
-    tgShadow       = new Toggle("drop shadow",   margin,       y, parent.dropShadow);
-    tgShadowGlobal = new Toggle("global shadow", margin + 160, y, parent.shadowGlobal);
-    y += 40;
-    tgExtrude = new Toggle("extrude 3D", margin, y, parent.extrude3D);
-    y += 40;
+    tgWinged = new Toggle("winged",       colLX,       y, parent.winged);
+    tgInvert = new Toggle("invert/level", colLX + 155, y, parent.invertPerLevel);
+    y += 38;
+    tgShadow       = new Toggle("drop shadow",   colLX,       y, parent.dropShadow);
+    tgShadowGlobal = new Toggle("global shadow", colLX + 155, y, parent.shadowGlobal);
+    y += 38;
+    tgExtrude = new Toggle("extrude 3D", colLX,       y, parent.extrude3D);
+    tgAnim    = new Toggle("animate",    colLX + 155, y, parent.animEnabled);
+    y += 38;
+    tgGrid    = new Toggle("grid overlay", colLX,     y, parent.showGrid);
+    y += 42;
 
-    bShape = new Button("shape: square", margin, y, width - 2 * margin, 30);
-    y += 40;
+    bShape   = new Button("shape: square",    colLX, y, colW, 30); y += 38;
+    bScheme  = new Button("scheme: duotone",  colLX, y, colW, 30); y += 38;
+    bSym     = new Button("symmetry: none",   colLX, y, colW, 30); y += 38;
+    bExtrude = new Button("extrude: oblique", colLX, y, colW, 30);
 
-    bScheme = new Button("scheme: duotone", margin, y, width - 2 * margin, 30);
-    y += 40;
+    // ===== RIGHT COLUMN: animation, image mode, palette, actions =====
+    int yr = 56;
+    // animation: master rate + per-target depth (disc is connection-safe; band/
+    // rot/arc BREAK the seamless connection -- labelled, default depth 0).
+    sliders.add(new Slider("anim rate",  colRX, yr, 0, 2, parent.animRateHz,     false)); yr += rowH;  // 10
+    sliders.add(new Slider("disc depth", colRX, yr, 0, 1, parent.lfoDisc.depth,  false)); yr += rowH;  // 11
+    sliders.add(new Slider("band depth*", colRX, yr, 0, 1, parent.lfoBand.depth, false)); yr += rowH;  // 12
+    sliders.add(new Slider("rot depth*",  colRX, yr, 0, 1, parent.lfoRot.depth,  false)); yr += rowH;  // 13
+    sliders.add(new Slider("arc depth*",  colRX, yr, 0, 1, parent.lfoSweep.depth, false)); yr += rowH + 8;  // 14
 
-    bSym = new Button("symmetry: none", margin, y, width - 2 * margin, 30);
-    y += 40;
+    // image mode (Truchet halftone of a source image)
+    imgLabelY = yr; yr += 24;
+    sliders.add(new Slider("img cols",  colRX, yr, 8,  96,  parent.imgCols,  true));  yr += rowH;  // 15
+    sliders.add(new Slider("img lib",   colRX, yr, 32, 512, parent.libSize,  true));  yr += rowH;  // 16
+    sliders.add(new Slider("img gamma", colRX, yr, 0.2, 3.0, parent.imgGamma, false)); yr += rowH + 2;  // 17
+    tgImage      = new Toggle("image mode",  colRX,       yr, parent.imageMode);
+    tgImgStretch = new Toggle("stretch",     colRX + 155, yr, parent.imgStretch); yr += 36;
+    tgImgInvert  = new Toggle("invert map",  colRX,       yr, parent.imgInvert);
+    tgImgContain = new Toggle("contain",     colRX + 155, yr, parent.imgContain); yr += 38;
+    bImgLoad = new Button("Load image…", colRX, yr, colW, 30); yr += 50;
 
-    bExtrude = new Button("extrude: oblique", margin, y, width - 2 * margin, 30);
-    y += 44;
+    palLabelY = yr; yr += 24;
+    bPrev = new Button("<",      colRX,      yr, 30, 32);
+    bNext = new Button(">",      colRX + 34, yr, 30, 32);
+    bRot  = new Button("rotate", colRX + 68, yr, 60, 32);
+    swatchY = yr; swatchH = 32;
+    yr += 32 + 22;
 
-    palLabelY = y; y += 26;
-    bPrev = new Button("<",      margin,      y, 30, 32);
-    bNext = new Button(">",      margin + 34, y, 30, 32);
-    bRot  = new Button("rotate", margin + 68, y, 60, 32);
-    swatchY = y; swatchH = 32;
-    y += 32 + 26;
-
-    bSeed = new Button("New seed", margin,       y, 150, 36);
-    bSave = new Button("Save PNG", margin + 162, y, width - margin - (margin + 162), 36);
+    bSeed = new Button("New seed", colRX,       yr, 150, 36);
+    bSave = new Button("Save PNG", colRX + 162, yr, colW - 162, 36);
   }
 
   public void draw() {
@@ -99,6 +125,8 @@ public class ControlWindow extends PApplet {
     drawToggle(tgShadow);
     drawToggle(tgShadowGlobal);
     drawToggle(tgExtrude);
+    drawToggle(tgAnim);
+    drawToggle(tgGrid);
 
     bShape.label = "shape: " + parent.SHAPE_NAMES[parent.shapeMode];
     drawButton(bShape);
@@ -114,16 +142,16 @@ public class ControlWindow extends PApplet {
 
     // palette name + swatches
     fill(170); textAlign(LEFT, CENTER);
-    text("Palette", margin, palLabelY);
+    text("Palette", colRX, palLabelY);
     fill(235);  textAlign(RIGHT, CENTER);
-    text(parent.palettes.current().title, width - margin, palLabelY);
+    text(parent.palettes.current().title, colRX + colW, palLabelY);
     textAlign(LEFT, CENTER);
     drawButton(bPrev);
     drawButton(bNext);
     drawButton(bRot);
     color[] cols = parent.palettes.current().colors;
     float sx0 = bRot.x + bRot.w + 10;
-    float sw  = (width - margin - sx0) / cols.length;
+    float sw  = (colRX + colW - sx0) / cols.length;
     noStroke();
     for (int i = 0; i < cols.length; i++) {
       fill(cols[i]);
@@ -132,17 +160,40 @@ public class ControlWindow extends PApplet {
 
     drawButton(bSeed);
     drawButton(bSave);
+
+    // image-mode section
+    fill(170); textAlign(LEFT, CENTER);
+    text("Image mode (Truchet halftone)", colRX, imgLabelY);
+    drawToggle(tgImage);
+    drawToggle(tgImgStretch);
+    drawToggle(tgImgInvert);
+    drawToggle(tgImgContain);
+    bImgLoad.label = (parent.imagePath == null)
+      ? "Load image…"
+      : "Image: " + imgBaseName(parent.imagePath);
+    drawButton(bImgLoad);
+  }
+
+  // last path component, for the load button label.
+  String imgBaseName(String p) {
+    int i = max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+    return i >= 0 ? p.substring(i + 1) : p;
   }
 
   // ---- widget rendering ----
+  // Each slider's track runs within its own column, from a fixed label gutter to
+  // the column's right edge.
+  float trkX0(Slider s) { return s.colX + 118; }
+  float trkX1(Slider s) { return s.colX + colW; }
+
   void drawSlider(Slider s) {
     fill(205); textAlign(LEFT, CENTER);
-    text(s.label, margin, s.y);
+    text(s.label, s.colX, s.y);
     stroke(90); strokeWeight(3);
-    line(trackX0, s.y, trackX1, s.y);
+    line(trkX0(s), s.y, trkX1(s), s.y);
     noStroke();
     fill(150);
-    text(s.isInt ? str((int) s.value) : nf(s.value, 0, 2), margin, s.y + 17);
+    text(s.isInt ? str((int) s.value) : nf(s.value, 0, 2), s.colX, s.y + 16);
     fill(s == active ? color(255, 200, 0) : color(120, 180, 255));
     ellipse(knobX(s), s.y, 16, 16);
   }
@@ -168,13 +219,13 @@ public class ControlWindow extends PApplet {
 
   float knobX(Slider s) {
     float t = (s.value - s.lo) / (s.hi - s.lo);
-    return lerp(trackX0, trackX1, constrain(t, 0, 1));
+    return lerp(trkX0(s), trkX1(s), constrain(t, 0, 1));
   }
 
   // ---- interaction ----
   public void mousePressed() {
     for (Slider s : sliders) {
-      if (abs(mouseY - s.y) < 16 && mouseX > trackX0 - 16 && mouseX < trackX1 + 16) {
+      if (abs(mouseY - s.y) < 16 && mouseX > trkX0(s) - 16 && mouseX < trkX1(s) + 16) {
         active = s; setSliderFromMouse(s); return;
       }
     }
@@ -183,15 +234,22 @@ public class ControlWindow extends PApplet {
     if (tgShadow.hit(mouseX, mouseY)) { tgShadow.value = !tgShadow.value; syncParent(); return; }
     if (tgShadowGlobal.hit(mouseX, mouseY)) { tgShadowGlobal.value = !tgShadowGlobal.value; syncParent(); return; }
     if (tgExtrude.hit(mouseX, mouseY)) { tgExtrude.value = !tgExtrude.value; syncParent(); return; }
-    if (bShape.hit(mouseX, mouseY))  { parent.shapeMode = (parent.shapeMode + 1) % 3; parent.redraw(); return; }
-    if (bScheme.hit(mouseX, mouseY)) { parent.colorScheme = (parent.colorScheme + 1) % 5; parent.redraw(); return; }
-    if (bSym.hit(mouseX, mouseY))    { parent.symmetryMode = (parent.symmetryMode + 1) % parent.SYMMETRY_NAMES.length; parent.redraw(); return; }
+    if (tgAnim.hit(mouseX, mouseY))  { tgAnim.value = !tgAnim.value; parent.setAnimEnabled(tgAnim.value); return; }
+    if (tgGrid.hit(mouseX, mouseY))  { tgGrid.value = !tgGrid.value; parent.showGrid = tgGrid.value; parent.redraw(); return; }
+    if (bShape.hit(mouseX, mouseY))  { parent.shapeMode = (parent.shapeMode + 1) % 4; parent.dirtyLayout = true; parent.imgDirty = true; parent.redraw(); return; }
+    if (bScheme.hit(mouseX, mouseY)) { parent.colorScheme = (parent.colorScheme + 1) % 5; parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
+    if (bSym.hit(mouseX, mouseY))    { parent.symmetryMode = (parent.symmetryMode + 1) % parent.SYMMETRY_NAMES.length; parent.dirtyLayout = true; parent.redraw(); return; }
     if (bExtrude.hit(mouseX, mouseY)) { parent.extrudeMode = (parent.extrudeMode + 1) % parent.EXTRUDE_NAMES.length; parent.redraw(); return; }
-    if (bPrev.hit(mouseX, mouseY))   { parent.palettes.prev(); parent.redraw(); return; }
-    if (bNext.hit(mouseX, mouseY))   { parent.palettes.next(); parent.redraw(); return; }
-    if (bRot.hit(mouseX, mouseY))    { parent.palettes.current().rotate(); parent.redraw(); return; }
-    if (bSeed.hit(mouseX, mouseY))   { parent.seedVal = (int) random(1, 99999); parent.redraw(); return; }
+    if (bPrev.hit(mouseX, mouseY))   { parent.palettes.prev(); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
+    if (bNext.hit(mouseX, mouseY))   { parent.palettes.next(); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
+    if (bRot.hit(mouseX, mouseY))    { parent.palettes.current().rotate(); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
+    if (bSeed.hit(mouseX, mouseY))   { parent.seedVal = (int) random(1, 99999); parent.dirtyLayout = true; parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
     if (bSave.hit(mouseX, mouseY))   { parent.saveRequested = true; parent.redraw(); return; }
+    if (tgImage.hit(mouseX, mouseY))      { tgImage.value = !tgImage.value; parent.imageMode = tgImage.value; parent.imgDirty = true; parent.redraw(); return; }
+    if (tgImgStretch.hit(mouseX, mouseY)) { tgImgStretch.value = !tgImgStretch.value; parent.imgStretch = tgImgStretch.value; parent.imgDirty = true; parent.redraw(); return; }
+    if (tgImgInvert.hit(mouseX, mouseY))  { tgImgInvert.value = !tgImgInvert.value; parent.imgInvert = tgImgInvert.value; parent.imgDirty = true; parent.redraw(); return; }
+    if (tgImgContain.hit(mouseX, mouseY)) { tgImgContain.value = !tgImgContain.value; parent.imgContain = tgImgContain.value; parent.imgDirty = true; parent.redraw(); return; }
+    if (bImgLoad.hit(mouseX, mouseY))     { selectInput("Select an image", "imageChosen", null, parent); return; }
   }
 
   public void mouseDragged() { if (active != null) setSliderFromMouse(active); }
@@ -207,10 +265,11 @@ public class ControlWindow extends PApplet {
     bRot.hot    = bRot.hit(mouseX, mouseY);
     bSeed.hot   = bSeed.hit(mouseX, mouseY);
     bSave.hot   = bSave.hit(mouseX, mouseY);
+    bImgLoad.hot = bImgLoad.hit(mouseX, mouseY);
   }
 
   void setSliderFromMouse(Slider s) {
-    float t = constrain((mouseX - trackX0) / (trackX1 - trackX0), 0, 1);
+    float t = constrain((mouseX - trkX0(s)) / (trkX1(s) - trkX0(s)), 0, 1);
     float v = lerp(s.lo, s.hi, t);
     s.value = s.isInt ? round(v) : v;
     syncParent();
@@ -218,9 +277,27 @@ public class ControlWindow extends PApplet {
 
   // Push every control value to the main sketch and repaint it.
   void syncParent() {
-    parent.gridN          = (int) sliders.get(0).value;
-    parent.maxDepth       = (int) sliders.get(1).value;
-    parent.subdivideProb  = sliders.get(2).value;
+    int   ng = (int) sliders.get(0).value;
+    int   nd = (int) sliders.get(1).value;
+    float ns = sliders.get(2).value;
+    if (ng != parent.gridN || nd != parent.maxDepth || ns != parent.subdivideProb)
+      parent.dirtyLayout = true;          // only these sliders change the tile layout
+    // image-mode sliders (appended after the animation block)
+    int   ic = (int) sliders.get(15).value;
+    int   il = (int) sliders.get(16).value;
+    float ig = sliders.get(17).value;
+    // anything that changes a patch's appearance or the mapping invalidates the
+    // brightness library / mosaic -> rebuild on next draw.
+    if (nd != parent.maxDepth || ns != parent.subdivideProb
+        || tgWinged.value != parent.winged || tgInvert.value != parent.invertPerLevel
+        || ic != parent.imgCols || il != parent.libSize || ig != parent.imgGamma)
+      parent.imgDirty = true;
+    parent.imgCols  = ic;
+    parent.libSize  = il;
+    parent.imgGamma = ig;
+    parent.gridN          = ng;
+    parent.maxDepth       = nd;
+    parent.subdivideProb  = ns;
     parent.shadowAngle    = radians(sliders.get(3).value);
     parent.shadowSize     = sliders.get(4).value;
     parent.shadowStrength = sliders.get(5).value;
@@ -228,6 +305,12 @@ public class ControlWindow extends PApplet {
     parent.vpY            = sliders.get(7).value;
     parent.extrudeDepth   = sliders.get(8).value;
     parent.extrudeShade   = sliders.get(9).value;
+    parent.applyAnimRate(sliders.get(10).value);          // master LFO rate
+    parent.lfoDisc.depth  = sliders.get(11).value;        // connection-safe
+    parent.lfoBand.depth  = sliders.get(12).value;        // * breaks connection
+    parent.lfoRot.depth   = sliders.get(13).value;        // *
+    parent.lfoSweep.depth = sliders.get(14).value;        // * (arc drives sweep + radius)
+    parent.lfoRadius.depth = sliders.get(14).value;
     parent.winged         = tgWinged.value;
     parent.invertPerLevel = tgInvert.value;
     parent.dropShadow     = tgShadow.value;
@@ -239,9 +322,9 @@ public class ControlWindow extends PApplet {
 
 // ---- plain widget data holders ---------------------------------
 class Slider {
-  String label; int y; float lo, hi, value; boolean isInt;
-  Slider(String label, int y, float lo, float hi, float value, boolean isInt) {
-    this.label = label; this.y = y; this.lo = lo; this.hi = hi;
+  String label; int colX, y; float lo, hi, value; boolean isInt;
+  Slider(String label, int colX, int y, float lo, float hi, float value, boolean isInt) {
+    this.label = label; this.colX = colX; this.y = y; this.lo = lo; this.hi = hi;
     this.value = value; this.isInt = isInt;
   }
 }
