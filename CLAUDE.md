@@ -38,8 +38,10 @@ square/triangle/hexagon/trapezoid, **P/p** = prev/next palette, **R** = rotate p
 **C** = colour scheme, **M** = symmetry (none/vertical/horizontal/quad/rot 180/
 tile mir V/H/quad), **e** = toggle 3D extrusion, **E** = cycle extrude mode
 (oblique/1-point), **a** = toggle animation, **g** = toggle base-grid overlay,
-**l** = toggle line mode (parallel/concentric strokes), **S** = save a
-parameter-stamped PNG.
+**l** = toggle line mode (parallel/concentric strokes), **k** = toggle Kumiko
+lattice style (thin mitered strips, no wings — see "Kumiko lattice style" below),
+**d** = toggle debug logging (see "Debug logging" below),
+**S** = save a parameter-stamped PNG.
 
 **Saving** (`saveTiling`, S key or the Controls Save button): the filename encodes
 the displayed parameters + seed (e.g.
@@ -47,7 +49,50 @@ the displayed parameters + seed (e.g.
 headless command that reproduces the frame is printed to the console** (with
 `TRUCHET_SCALE=2` so you can re-render the identical composition at higher
 resolution — every render-affecting global has a matching `TRUCHET_*` override).
-Headless runs (`TRUCHET_OUT`) also echo `name:` + `reproduce:` lines.
+Headless runs (`TRUCHET_OUT`) also echo `name:` + `reproduce:` lines. Saves land in
+a flat, gitignored `hires/` folder (`renderDir()`), parameter-stamped filename as
+the index; the printed reproduce command writes its scaled export there too.
+
+The filename (`saveBaseName`/`appearanceTokens`) is a *faithful* spec, not just an
+index: beyond the always-shown layout fields it appends any appearance param that
+**deviates from its default** — anchors/side (`k4`), line duty/subdiv (`line15d30s60`),
+the duotone random fg/bg (`duo3-7`), shadow strength/size/angle (`sh50-40-45`), extrude
+vp/depth/shade — so a default render keeps a short name but a tweak is never silently
+dropped on a headless re-render (`reproduceCmd` still lists *every* param
+unconditionally, `TRUCHET_ANCHORS` included). Continuous values round to integer
+percent/degrees in the name.
+
+**Render manifest — the authoritative, complete recipe (`renderManifest`/
+`loadManifest`).** The filename is a lossy human index and `reproduceCmd` is env-only;
+both historically omitted three pieces of *implicit* state — tile weights (Tiles-panel
+edits), `anchorsPerSide`, and palette rotation — so a re-render could silently diverge
+(this actually bit a real reproduction: a `k4` triangle frame re-rendered at the
+default `k1` and at uniform weights, a completely different pattern). The fix: **every
+save writes a JSON sidecar beside the PNG** (`foo.png` → `foo.json`, both the GUI
+`saveTiling` and the headless `TRUCHET_OUT` path). The manifest holds **every render
+global PLUS the exact tile catalog** (`currentCatalogJson()` — every tileset (all
+shapes, all k) plus trapezoid weights, in the v2 `tiles.json` schema) **plus the
+active-tileset selection** (`activeTilesets`, the per-(n,k) chosen tileset index) **and
+the palette's exact colour order** (captures rotation). `TRUCHET_LOAD=foo.json`
+(parsed first in `setup()`, so explicit `TRUCHET_*` vars still override — load a frame,
+bump `TRUCHET_SCALE`) and the Controls **"Load render…"** button (`manifestChosen`)
+both restore it via `loadManifest`, which sets the globals, overwrites the palette
+colours, and applies the embedded catalog through the shared `applyCatalog()` (same
+in-place reassignment `loadTileCatalog` uses, so `connsFor`/`weightsFor` and the panels
+pick it up by reference). Because the catalog is *embedded*, reproduction is
+**independent of `tiles.json` drift** — verified byte-identical (max pixel diff 0) even
+after `tiles.json` weights are changed out from under it. `TRUCHET_SCALE`/`W`/`H` stay
+env-only (they are output *resolution*, not composition), so one manifest renders the
+same frame at any size. A GUI manifest load sets `controlsNeedSync`, and
+`ControlWindow.syncFromParent()` refreshes the panel widgets next frame (otherwise the
+sliders show stale values and the next drag would push the old set back).
+
+The **GUI app starts with the active tileset's authored weights** — selecting a
+curated 16-tile **tileset** is the point, so there is no blank-slate reset (the old
+`zeroAllWeights()` startup call was removed). Tweak the mix live with the Tiles-panel
+sliders, or switch tilesets with its selector. A tileset slot with weight 0 (or a blank
+slot) is simply never picked; if *every* weight in the active tileset is 0,
+`pickWeighted()` returns −1 and tiles render **blank** (wings only).
 
 **Symmetry** (`symmetryMode`) comes in two mechanisms, deliberately different:
 
@@ -97,11 +142,27 @@ Headless runs (`TRUCHET_OUT`) also echo `name:` + `reproduce:` lines.
     children dropped — a twin covers them — and on-axis children kept) and
     straddler leaves roll a **self-symmetric motif** (`pickSymmetricMotifMulti`
     + `selfMirrorMotif`: keep the (mi, mk) pairs whose connection set maps onto
-    itself under the edge reflection `e → c0−1−e`, with `c0` per axis — vertical
+    itself under the axis reflection, with the edge origin `c0` per axis — vertical
     `(PI−2·rot)/(2π/n)`, horizontal `−2·rot/(2π/n)` — and for quad straddlers,
     symmetric about *both*; weighted as the normal roll conditioned on
-    symmetry). `addSymTwins()` emits the orbit (≤3 twins; an axis the tile
-    straddles fixes it, collapsing the diagonal onto the surviving reflection).
+    symmetry). The reflection acts on **ports** (`rotPort`/`reflPort`): a port
+    (edge e, slot s) → (edge c0−1−e, slot k−1−s) — the edge reflects and, because a
+    reflection reverses anchor order along an edge, the slot reverses too (k=1 = the
+    plain edge reflection `e → c0−1−e`). So multi-anchor straddlers (k>1) get a
+    truly self-symmetric motif, not just an edge-symmetric one. `addSymTwins()`
+    emits the orbit (≤3 twins; an axis the tile straddles fixes it, collapsing the
+    diagonal onto the surviving reflection).
+    - **All four structural modes (4–7) work for any k** (verified 0% pixel
+      mismatch at k=2 on the exact axes). The twin/rotation transforms reuse the
+      source motif unchanged: a reflection/rotation is affine, mapping source
+      vertex e → twin vertex e and so source anchor (e,s) → twin anchor (e,s)
+      (slot preserved), making the twin the exact mirror with no port relabelling.
+      The one subtlety: a multi-anchor connection across *opposite* (parallel)
+      edges is a bezier, and `lineIntersect`'s tiny-denominator cutoff would flip a
+      near-parallel pair between bezier and a huge-radius arc under FP noise —
+      breaking the twin match — so the arc/bezier choice uses the scale-invariant
+      `nearlyParallel` (|sin| of the edge angle) instead, which a tile and its
+      flipped twin always agree on.
     NB: because the H axis is off-centre, verifying H symmetry by pixel-diffing
     against an *integer*-rounded reflected coordinate massively inflates the
     mismatch on horizontal-ish edges (≈7%); reflect with the exact float axis
@@ -124,6 +185,39 @@ TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 TRUCHET_SEED=7 \
 ```
 
 renders one frame to `TRUCHET_OUT` and exits, skipping the GUI windows.
+
+**Debug logging** (`TRUCHET_DEBUG=1` env, or the **d** key live; main tab). A
+thread-tagged action+phase log for tracing crashes — built because the three windows
+(viz, Controls, Tiles) run on separate threads and mutate the shared globals, so the
+prime suspect for the intermittent NPE is a **cross-thread race** (a panel edit swaps
+the catalog / nulls `gradPaint` / rebuilds `leaves` mid-render). The facility
+(`dbg`/`logAction`/`phase`/`dbgCrash`) prints `[+<s>][<thread>] CAT: msg` to the
+console **and** to `logs/debug-<ms>.log` (gitignored, opened lazily, append mode), so
+a crash that closes the window is still captured. `dbg()` early-returns when off, so
+the off path is **byte-identical** (verified: same headless PNG with and without
+`TRUCHET_DEBUG`, no `logs/` written). What it records:
+- **ACTION** — every user action with its effect: `keyPressed` (logged at entry as
+  `KEY '<k>'`), Controls toggles/buttons/sliders (`logAction` per branch +
+  `setSliderFromMouse`), Tiles weight edits + reload, and the `manifestChosen`/
+  `imageChosen` file dialogs (the prime race triggers). `lastAction` is quoted in a
+  crash dump.
+- **PHASE** — a cheap `renderPhase` breadcrumb set before each `draw()` step
+  (`updateAnim`/`setupGradient`/`rebuildLeaves`/`renderTiling`/`applySymmetry`/…).
+  Assigned always (read by the crash dump); the `dbg` line is emitted only when
+  animation is **off**, so continuous playback doesn't flood the log.
+- **CRASH** — `draw()` and **both panels' `draw()`** are wrapped in
+  `try/catch (Throwable)` → `dbgCrash`, which dumps the offending **thread**,
+  `lastAction`, `renderPhase`, a state line (scheme/shape/k/sym/image/line/extrude/
+  seed) and the full stack trace to console + log, then `noLoop()`s to stop a flood.
+  A crash is always recorded even if `d` was never pressed.
+- **NULL** — defensive warnings (not throws) at the suspect dereferences
+  (`gradPaint` in scheme 4, a null tile alphabet in `TileGeom`, `sourceImg` in
+  `sampleGrid`) so a near-miss names the site.
+
+The last `ACTION` + `thread` + `phase` before a `CRASH` block is what pins the
+trigger. This only instruments — fixing the race (e.g. routing the offending panel
+mutation through a viz-thread flag like `reloadCatalogRequested`/`saveRequested`) is a
+follow-up.
 **Resolution.** The canvas defaults to 1920×1080 but the tiling is fully
 resolution-independent (every length derives from `width`/`height`), so a larger
 canvas gives the SAME composition at higher resolution — a print/wallpaper export.
@@ -134,7 +228,10 @@ window, big PNG" export use the headless path (`TRUCHET_OUT`), which opens no
 window. Big sizes cost memory (the shadow/extrude `BufferedImage` layers are
 `width*height*4` bytes each, ~133 MB apiece at 8K). Example:
 `TRUCHET_SCALE=2 TRUCHET_OUT=/tmp/4k.png processing-java --sketch=… --run`.
-Optional overrides: `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon, 3 trapezoid),
+Optional overrides: `TRUCHET_LOAD` (path to a render manifest `.json` — restores the
+complete recipe as a baseline; any other `TRUCHET_*` set alongside still overrides it,
+e.g. `TRUCHET_LOAD=foo.json TRUCHET_SCALE=4` re-renders the saved frame at 8K — see
+"Render manifest" above), `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon, 3 trapezoid),
 `TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_PALETTE` (index, wraps),
 `TRUCHET_DUO` (`"bgIdx,fgIdx"` = duotone fg/bg as two palette-colour indices, the
 reproducible form of the duotone "rotate"; omit for the default luminance extremes),
@@ -143,7 +240,11 @@ reproducible form of the duotone "rotate"; omit for the default luminance extrem
 re-derived from `buildRoots()` so it covers the whole canvas in every symmetry
 mode — see `drawGridOverlay`), `TRUCHET_GRID`, `TRUCHET_DEPTH` (0 = single scale), `TRUCHET_SUBDIV` (subdivide
 probability 0–1; `1` = uniform finest scale, handy for isolating subdivision
-behaviour from coarse/fine mixing), `TRUCHET_SHADOW` (0/1),
+behaviour from coarse/fine mixing), `TRUCHET_ANCHORS` (anchor points per side k,
+1–4; 1 = classic single-midpoint tiles; k>1 draws the active tileset's multi-anchor
+tile types for that k — see "Multiple anchor points per side"), `TRUCHET_TILESET`
+(active tileset index for the current shape+k; selects which 16-tile set renders — see
+"Shared tile catalog"), `TRUCHET_SHADOW` (0/1),
 `TRUCHET_SHADOW_STR` (darkness 0–1), `TRUCHET_SHADOW_SIZE` (offset, fraction of
 the band stroke; unclamped here for exaggerated tests), `TRUCHET_SHADOW_ANGLE`
 (shadow direction, degrees), `TRUCHET_SHADOW_GLOBAL`
@@ -160,6 +261,9 @@ Line mode (parallel/concentric strokes — see "Line mode" below): `TRUCHET_LINE
 `TRUCHET_LINE_DUTY` (ink fraction of the pitch, 0–1), `TRUCHET_LINE_SUBDIV`
 (0–1 = per-stroke probability of subdividing into the line bundle vs drawing the
 original full-thickness stroke; `1` = all lines, plain line mode).
+Kumiko lattice style (thin mitered strips — see "Kumiko lattice style" below):
+`TRUCHET_KUMIKO` (0/1), `TRUCHET_STRIP` (strip width as a fraction of the tile
+side, default 0.10).
 Animation (headless verification of motion — the loop never starts in headless;
 these pin a single deterministic frame): `TRUCHET_ANIM_T` (seconds → LFO-driven
 frame at that phase), `TRUCHET_ANIM_RATE` (master LFO Hz), `TRUCHET_ANIM_DEPTH`
@@ -279,6 +383,104 @@ triangles** (a hexagon is not a rep-tile; see `children()`); those triangles *do
 use wings. So hexagon mode mixes whole-hexagon tiles (coarse) with winged triangle
 detail (finer).
 
+**Multiple anchor points per side** (`anchorsPerSide` = k, global; `TRUCHET_ANCHORS`,
+Controls slider, default 1). A side carries **k ports** at `(s+0.5)/k` along the
+edge (k=1 = the classic single midpoint). Everything scales by `1/k`: band width
+`side/(3k)`, fg nub radius `side/(6k)`, and the bg wing discs (radius `side/(3k)`)
+sit at the **k sub-segment boundaries per edge** (`s/k`, `s=0..k-1`) — i.e. the
+corners *plus* the points *between* adjacent anchors — so each port crosses at the
+central third of its `1/k` sub-segment and the bg discs fill the edge gaps between
+bands. Every `1/k` sub-segment therefore reads as a self-contained k=1 edge
+(bg-disc / band / bg-disc), and like the corner discs the between-anchor discs
+coincide across a shared edge. (`bgWx` lists the n·k boundaries, `fgWx` the n·k
+anchors; for k=1 they collapse to vertices / edge midpoints, byte-identical.) The
+thirds invariant
+**generalises**: a coarse edge's crossings stay a subset of its children's (verified
+k=2), so the seamless multi-scale join holds — but **only when k is uniform across
+the whole tiling** (a k=2 edge crosses at {1/6,1/3,2/3,5/6}, a k=3 edge at
+{1/9,2/9,…}; they don't align), which is why k is a *global render parameter*, not
+per-tile.
+
+**Ports** number `n·k + 2n + 1`: the `n·k` **edge anchors** (`port = edge·k + slot`),
+then `n` **apothem midpoints** (`n·k + e` = halfway from the centre to edge e's
+midpoint), then the **centre** (`n·k + n`), then the `n` **vertices** (corners,
+`n·k + n + 1 + v`). The apothem/centre/vertices are all *interior* ports
+(`isInteriorPort`, `portXY` — vertices read as interior so they too get drawn
+straight: a corner has no single edge line to arc on) — connection endpoints with no
+wing nub (only edge anchors get nubs/the wing lattice). Vertices are the **Kumiko
+lattice points**: strips run corner → opposite edge midpoint → centroid (asanoha).
+They were appended *after* the centre so every existing `tiles.json` conn index is
+unchanged. `selfMirrorMotif` returns false for any conn touching a vertex port
+(`rotPort`/`reflPort` don't map corners), so straddlers in the structural symmetry
+modes skip vertex motifs. A connection is:
+- a **perpendicular circular arc** when both ports are edge anchors equidistant from
+  their two edge-lines' intersection (all symmetric pairs, and every k=1 case →
+  identical to the old path);
+- a **cubic Bézier** (edge-anchor pair, asymmetric) with end tangents along the
+  inward edge normals — still perpendicular at each anchor → seamless;
+- a **straight line** when the connection is explicitly flagged `[a, b, 1]` *or*
+  touches an interior port (no edge line to arc on). Straight connections between
+  *adjacent* edges cross the edge off-perpendicular, so they don't connect across
+  scales (decorative); the wing nubs still bridge same-scale neighbours.
+- a **ring** — the tagged primitive `[CONN_CIRCLE, port]` (`= 102`) appends a closed
+  circle (centre-line radius `side/(3k)`) at any port, stroked at band width like a
+  band, so it flows through every pass and becomes **concentric rings** in line mode.
+  Edge-port rings are clipped to the tile (half rings); interior-port rings are
+  whole. `selfMirrorMotif` treats circle motifs as non-self-mirror (tagged), so
+  straddlers skip them; twins mirror them fine (a ring is rotation-symmetric).
+- a **solid point** — `[CONN_DOT, port]` (`= 103`) is a filled disc of band width
+  (radius `side/(6k)`, the wing-nub size) at any port. A fill, not a stroke, so it is
+  NOT in the band path (`appendMotifConn` returns for it); instead `gm.dotXY()` lists
+  the dot centres and the four fill passes (`drawTileForeground`, `drawTileLineBundle`,
+  `addTileShadow`, `drawExtrudeLevel`) draw/extrude/shadow them like wing nubs. Solid
+  in every mode (no rings in line mode). Mainly useful at interior ports (which get no
+  automatic nub); like circles it is tagged, so straddlers skip it and twins mirror it.
+
+**Circuit-inspired primitives (`= 104..111`, `isInlineComp`/`isPointGlyph`).** Two
+families of decorative motifs (NOT thirds-invariant — like adjacent-edge straight
+bands), all **stroked polylines** so they flow through every pass via
+`appendMotifConn` (solid stroke, drop shadow, 3D extrude, and line-mode offset =
+parallel copies). Because they are fine linework, they are stroked at a **thin,
+size-proportional weight** (`TileGeom.motifStrokeW()` = `side/(10k)`), NOT the full
+band width `side/3` — which would blob their detail together. `appendBandsSplit`
+routes the circuit motifs (`thinMotif()` = `isInlineComp || isPointGlyph`) into a
+separate path from the regular bands; the solid (`drawTileBands`), shadow
+(`addTileShadow`), and extrude (`drawExtrudeLevel`/`stampExtrudeBody`) passes each
+stroke that path at `motifStrokeW()`. Line mode already strokes everything thin
+(`lineStroke`), so it is unchanged. Mirrored in the Tiles-panel preview
+(`TileWindow.drawArchConn`/`drawArchGlyph`, reusing `parent.componentSD`) and the
+standalone editor (`drawComponent`/`drawGlyph`).
+- **inline components** `[code, a, b]` join two ports with straight leads + a motif
+  in the middle, amplitude `side/(3.5k)`. `appendComponent` maps a unit-frame
+  `componentSD(code, amp)` table — rows `{sFrac, dPerp}` or `{…, 1}` to start a new
+  subpath (capacitor plates) — onto the A→B axis, folding the line-mode `offset` into
+  the perpendicular. `CONN_RES` (`104`, resistor sawtooth zigzag), `CONN_IND` (`105`,
+  inductor — 3 same-side semicircle bumps), `CONN_CAP` (`106`, two perpendicular
+  plates with a gap between the leads), `CONN_STEP` (`107`, square-wave crenellation
+  / right-angle steps).
+- **point glyphs** `[code, port]` stamp one port and auto-orient **inward** (port →
+  centroid; screen-up at the centre port), via `TileGeom.appendGlyph` → top-level
+  `emitGlyph` in a local frame (`u` inward, `w` perpendicular, base unit `g =
+  side/(6k)`). Offset is ignored (a glyph is a fixed mark, not a bundle).
+  `CONN_GROUND` (`108`, stem + 3 decreasing bars), `CONN_ARROW` (`109`, shaft +
+  inward chevron), `CONN_CROSS` (`111`, a `+`). `CONN_TERM` (`110`, a small open ring)
+  is the exception — drawn via `appendCircle` at radius `side/(6k)`, so it goes
+  concentric in line mode like `CONN_CIRCLE`.
+
+All are sampled into the same polyline the stroke/shadow/extrude/line passes consume
+(`TileGeom.appendPortConn`; the dispatch in `appendMotifConn` routes to it for any
+`anchors > 1`, any interior port, or any straight-flagged conn, else the old k=1
+`appendConn`). k=1 with plain edge pairs is byte-identical to before (the per-pass
+`gm.bandW`/`fgR0`/`bgR0` equal `side/3`,`side/6`,`side/3`, and `gm.wholeHex` equals
+the old `n==6` test). Multi-anchor hexagons are treated like any winged polygon (clip
++ wings); the wing-less batched coarse layer is `wholeHex = n==6 && k==1` only.
+Per-(shape,k) alphabets are the **active tileset** for that (shape,k) (16 slots,
+authored in the editor; `connsFor`/`weightsFor` → `activeTilesetFor(n)`); a (shape,k)
+with no tileset renders blank (`BLANK_CONNS`). The straddler self-symmetry
+test (`selfMirrorMotif` + `rotPort`/`reflPort`) is interior-port aware: an apothem
+midpoint follows its edge under rotation/reflection, the centre is fixed — so
+structural symmetry stays exact with interior/straight motifs (verified 0% at k=2).
+
 **Seams / antialiasing.** Each tile's bands are stroked as ONE Java2D path
 (`drawTileBands`), so a tile's own bands union into a single antialiased shape (no
 1px gaps between separately-drawn strokes). Whole hexagons have no wings to bridge
@@ -381,6 +583,33 @@ stroke), while subdivided-stroke ports and unused ports keep the concentric ring
 `KEY_STROKE_CONTROL = VALUE_STROKE_PURE` — the default `STROKE_NORMALIZE` snaps
 thin strokes to the pixel grid and visibly jags long arcs; set once per frame on
 the main `g2` and on the shadow/extrude offscreen layers.)
+
+### Kumiko lattice style (thin mitered strips)
+
+`kumikoStyle` (key **k**, Controls toggle, `TRUCHET_KUMIKO`) renders bands as **thin
+uniform strips with a `JOIN_MITER`/`CAP_SQUARE` join** — the Japanese woodwork-lattice
+look (組子) — instead of the thick `side/3` Truchet band. Width is `stripWidthFrac *
+side` (`TRUCHET_STRIP`, "strip width" slider, default `0.10`). It is the render-time
+companion to the **vertex (corner) ports** the tile editor exposes: classic Kumiko
+motifs are straight strips between vertices, edge midpoints, and the centroid
+(asanoha = the three triangle medians, corner → opposite edge midpoint, crossing at
+the centroid — author it as triangle conns `[7,1] [8,2] [9,0]` at k=1).
+
+Three gates flip together when `kumikoStyle` is on: **wings off** (`wings = winged &&
+!wholeHex && !kumikoStyle`, so no bg corner discs / fg nubs — bare strips on the
+ground), **clip off** (`doClip = … && !kumikoStyle`, so strips spill across tile edges
+and meet their neighbours at the shared lattice points), and the **thin mitered
+stroke** at the three solid stroke sites via the shared `bandStroke(bandW, side, cap)`
+helper (`drawTileBands`, `strokeHexBatch`, `drawTileLineBundle`'s full-thickness path).
+Render-only — no layout rebuild — and **off ⇒ byte-identical** to the classic bands
+(`bandStroke` collapses to the original `new BasicStroke(bandW·anim, cap, JOIN_ROUND)`,
+and the wing/clip gates to their old expressions). **Multi-scale stays seamless**
+because a coarse triangle's vertices and edge midpoints coincide with its rep-tile
+children's lattice points, so a strip routed through those crosses edges at points that
+subdivide consistently (no thirds-invariant needed — Kumiko strips connect at the
+lattice, not via wing nubs). Wired into the filename (`_kumiko`+width%), `reproduceCmd`,
+and the render manifest (`kumiko`/`stripWidth`) like every other render global; a
+saved Kumiko frame re-renders byte-identical from its manifest (verified, max diff 0).
 
 ## Structure of the sketch
 
@@ -514,21 +743,55 @@ The `.pde` tabs are merged into one PApplet:
   Cloudflare-blocked in practice. To bake in more, add `fromHex(...)` lines there.
 - **`ControlWindow.pde`** — a second PApplet (own window, launched in `setup()`
   via `runSketch`) with immediate-mode sliders/buttons writing straight to the
-  main sketch's globals (`parent.*`) and calling `parent.redraw()`. If you add a
-  tunable global, add a widget here too. The bottom **Image mode** section
-  (img cols/lib/gamma sliders, image/stretch/invert toggles, a `selectInput`
-  "Load image…" button) drives the Truchet halftone; its widgets set `imgDirty`.
-- **`TileWindow.pde`** — a third PApplet window listing the active shape's tile
-  **archetypes** (`parent.connsFor(n)`, or `parent.TRAP_CONNS` for the trapezoid —
-  base connection sets, no rotations) with a slider per archetype that writes its
-  selection weight into `parent.weightsFor(n)` / `parent.TRAP_W` (the same
-  `TILE_W`/`TRI_W`/`HEX_W`/`TRAP_W` `pickWeighted` reads) and calls
-  `parent.redraw()`. It draws each archetype with its own `drawArchetype()` (a
-  compact copy of the band geometry, using `parent.lineIntersect`) — or
-  `drawTrapArchetype()` (sampling `parent.trapArcSpec`) for the trapezoid — since
-  drawing must target *this* window's canvas, not the main one. It reads
-  `parent.shapeMode` each frame, so it relists automatically when the shape changes
-  (the window is sized tall enough for the trapezoid's 8 archetypes).
+  main sketch's globals (`parent.*`) and calling `parent.redraw()`. **Tabbed
+  layout:** controls are grouped into seven switchable tabs — **Tiles** (shape +
+  anchors/side as segmented switches — a row of shape-pictogram buttons and a row
+  of 1–4 number buttons, each custom-drawn via `drawShapeButton`/`drawSegButton`/
+  `drawShapePicto` and hit-tested in the `TAB_TILES` branch rather than registered
+  in the `buttons` list; then grid, depth, subdiv sliders + winged, grid overlay
+  toggles), **Color** (scheme, palette
+  prev/next/rotate + swatches, invert/level), **Sym** (symmetry mode + a help
+  blurb), **Shadow** (drop/global shadow + angle/size/strength, extrude 3D + mode,
+  vp x/y, extrude depth/shade), **Anim** (animate, rate, disc/band/rot/arc depth),
+  **Render** (line mode, count/duty/subdiv, kumiko style, strip width), and
+  **Image** (image mode + halftone params + Load image). A **persistent bottom
+  action bar** (tab `-1`: New seed / Save PNG / Load render…) shows on every tab.
+  Each widget carries a `tab` index; `draw()`/`mousePressed()` only render and
+  hit-test the active tab's widgets (plus tab `-1`), and every tab lays out from
+  the shared `contentTop` (tabs reuse the same vertical space — so the panel is
+  compact, `480×560`). A click on the tab bar (`tabAt`) just sets `activeTab`. If
+  you add a tunable global, add a widget here too (via the `addSlider`/`addToggle`/
+  `addButton` factory helpers, passing the owning tab) — and extend **both**
+  `syncParent()` (widgets → globals, on edit) and `syncFromParent()` (globals →
+  widgets, after a manifest load sets `controlsNeedSync`), or the panel drifts out
+  of agreement. **Wiring is by named reference** (`sGrid`, `tgShadow`, …), *not*
+  list index — so widgets can be freely reordered across tabs without misbinding a
+  control (the old layout was index-based and fragile: a new slider had to be
+  appended last to keep positions put). The "Load render…" button `selectInput`s a
+  manifest → `manifestChosen`; "Load image…" → `imageChosen`. Image-mode widgets
+  set `imgDirty`.
+- **`TileWindow.pde`** — a third PApplet window for the active shape's **active
+  tileset**. A **tileset selector strip** at the top (`◀ / label / ▶`, via
+  `parent.setActiveTileset(±1)` + `parent.tilesetCount()`/`activeTilesetOrdinal()`)
+  switches which 16-tile set is active for the current (shape, k); below it the grid
+  lists that tileset's 16 slots (`parent.connsFor(n)`, or `parent.TRAP_CONNS` for the
+  trapezoid — built-in, not a tileset, so the selector is hidden for it) with a slider
+  per slot that writes its weight into `parent.weightsFor(n)` / `parent.TRAP_W` **in
+  place** (the same array `pickWeighted` reads) and calls `parent.redraw()`. It draws
+  each slot with its own `drawArchetype()` (a compact copy of the band geometry, using
+  `parent.lineIntersect`) — or `drawTrapArchetype()` (sampling `parent.trapArcSpec`)
+  for the trapezoid — since drawing must target *this* window's canvas, not the main
+  one. It reads `parent.shapeMode`/`anchorsPerSide` each frame, so it relists
+  automatically. Slots are laid out in a **dense 2-column grid**
+  (`cols`/`rowH`/`tileSz` + the `cellX`/`trkX0`/`trkX1` per-column helpers);
+  `mousePressed`/`setWeight` map a click back to `(col, row) -> index`. A **"Reload
+  tiles.json"** button in the header re-reads the catalog *without restarting* — it
+  sets `parent.reloadCatalogRequested` (a flag, like the Save button, so the swap runs
+  on the viz thread at the top of `draw()`, not cross-thread); `draw()` then calls
+  `loadTileCatalog()` + sets `dirtyLayout`. Because `loadTileCatalog`/`applyCatalog`
+  reassign the tileset maps in place and the panels read them by reference, newly
+  authored tilesets appear immediately — this is the live-reload the "author →
+  restart" workflow used to require.
 - **`Animation.pde`** — the animation engine. The tile layout is stable per seed,
   so animation never rebuilds tiles: it modulates *render-time* geometry. A small
   registry (`AnimState anim`, normalized `volatile` `-1..+1` values:
@@ -584,6 +847,21 @@ The `.pde` tabs are merged into one PApplet:
   changes the tiling or colours, set the matching flag or the change won't show
   while animating.
 
+**Tagged tile primitives (square).** The 4-edge matching alphabet is mathematically
+complete at 5 archetypes (blank / single arc / single band / two diagonal arcs /
+two crossing bands — all the ways to pair ≤4 edges). To go beyond pairs, two
+`TILE_CONNS` entries are **tagged primitives**: a connection whose first slot is
+`>= CONN_TAG` (100) is not an edge pair but `{CONN_HUMP, i, j}` (an opposite-edge
+arch — a raised cosine that enters i and j perpendicular at the central third, so
+it stays seamless and multi-scale-safe) or `{CONN_HUB, e0, e1, …}` (a centre-spoke
+junction — straight spokes from the tile centroid to each listed edge midpoint; a
+3-spoke hub is a T/Y, generalizing the band = 2-spoke and CrossCross = 4-spoke).
+`TileGeom.appendBandsOffset` dispatches these (`appendMotifConn` → `appendHub`/
+`appendHump`) so they flow through every pass (bands, shadow, extrude, line mode)
+and the Tiles panel preview. They're excluded from straddler self-symmetry
+(`selfMirrorMotif` returns false for tagged conns). Rotation (`mk`) covers all
+orientations, so one hub + one hump archetype yields the full T/arch families.
+
 Per-shape alphabets: `TILE_CONNS`/`TILE_W` (square, in the main tab), `TRI_CONNS`
 (triangle: blank + single arc — one port per edge allows at most one arc),
 `HEX_CONNS` (whole-hexagon tiles: fully-connected matchings only — including
@@ -593,6 +871,108 @@ indices into `TRAP_PORT`, not edges). `connsFor(n)`/`weightsFor(n)` pick the rig
 one for the regular shapes; the trapezoid is keyed on `Tile.trap` instead (its `n`
 is 4 and would otherwise alias the square), so `collectTile`, `TileGeom`, and the
 panels branch on `trap`/`shapeMode == 3` to reach `TRAP_CONNS`/`TRAP_W`.
+
+The hardcoded square/triangle/hexagon alphabets (`TILE_CONNS`/`TRI_*`/`HEX_*`) are
+**built-in seed defaults** only — used to seed a fresh `tiles.json`; at runtime
+rendering routes through the **active tileset** (see "Shared tile catalog" below). The
+trapezoid is *not* catalogued (port-based, bespoke arc specs) and stays hardcoded.
+
+## Shared tile catalog (`tiles.json`): named 16-tile tilesets + tile editor
+
+Tile types are organised into **TILESETS**: a tileset is **exactly 16 tile slots**
+that share a shape and a k (anchors/side). Each (shape, k) may have several tilesets;
+the visualizer selects which one is **active** (Tiles-panel selector / `TRUCHET_TILESET`),
+and renders from it. The shared `tiles.json` (repo root) is authored in a standalone
+editor and read by the visualizer, so: build a tileset in the editor → select it in the
+visualizer. Runtime state lives in `tilesetsByNK` (key `"n_k"` → `ArrayList<Tileset>`)
+and `activeTilesetIdx` (key `"n_k"` → active index); `connsFor(n)`/`weightsFor(n)` →
+`activeTilesetFor(n)` resolve the active set's 16 conns/weights (by reference, so panel
+edits land live), `BLANK_CONNS` if that (shape, k) has none.
+
+`loadTileCatalog()` (main tab, early in `setup()` — before the headless `TRUCHET_OUT`
+return) loads `tiles.json`: **missing** → seed a fresh v2 default (one k=1 tileset per
+shape from the built-in alphabets, padded to 16) and write it; **old v1 (flat) file** →
+**back it up to `tiles.v1.backup.json`** and replace with the fresh seed (start fresh,
+no auto-migration); **v2** → `applyCatalog`. A v1 catalog *embedded in an old manifest*
+is converted on the fly (`v1ToV2`, splitting each (shape,k) group into 16-tile sets) so
+old renders still reproduce.
+
+- **Schema (v2):** `{ "version":2, "tilesets":[ … ] }`; each tileset is
+  `{ "shape":"square", "sides":n, "anchors":k, "tiles":[ …16… ] }`. `sides`/`anchors`
+  are per-tileset; each of the 16 `tiles` is `{ "conns":[…], "weight":n }` (a blank
+  slot = `{ "conns":[], "weight":0 }`). A connection is a JSON array of ints — a plain
+  `[i,j]` edge/port pair, `[a,b,1]` (straight), **or** a tagged primitive
+  `[CONN_HUB,…]`/`[CONN_HUMP,i,j]`/`[CONN_CIRCLE,p]`/`[CONN_DOT,p]` (codes ≥100);
+  `jsonToConns`/`connsToJson` round-trip **variable-length** conns. Ports index `n*k`
+  edge anchors + `n` apothem midpoints + the centre + `n` vertices (the Kumiko lattice
+  points). See "Multiple anchor points per side" and "Ports" above. (`jsonToTileset`/
+  `tilesetToJson` (de)serialize a tileset; `currentCatalogJson` dumps every tileset for
+  the manifest; the trapezoid keeps a separate `"trapezoid"` weights array.)
+- **Editor:** `TileEditor/TileEditor.pde` is a **separate sketch** (not a window of
+  the main one), in a subfolder — Processing only compiles a sketch folder's
+  top-level `.pde`, so it does not affect building/running the main sketch. Run it
+  with `processing-java --sketch=/mnt/e/Multiscale_Truchet/TileEditor --run`. Pick
+  Square/Triangle/Hexagon and an **anchors/side** count (k = 1..4), then create/select
+  a **tileset** for that (shape, k) — **New set** appends 16 blank slots, **< Set /
+  Set >** browse, **Del set** removes — and click a cell in the **4×4 slot grid** to
+  make it the edit target (its content loads into the work buffer). Author the motif:
+  pick a **tool** from the pictogram palette (right of the preview), then click points.
+  Clickable points are the edge anchors, the **interior** ports — the apothem midpoints
+  and the centre, drawn with a green tint — and the **vertices** (corners), drawn
+  **amber** (the Kumiko lattice points); connections touching an interior *or* vertex
+  port are always straight lines. The palette has two groups (`tool` int, `TOOL_*`;
+  `drawToolButton`/`drawToolIcon`): **Connect (2 clicks)** — click one point then a
+  second — is **Arc** (default: perpendicular arc / bezier, matching the engine),
+  **Line** (straight `[a,b,1]`), and the four inline components **Res / Ind / Cap /
+  Step** (`[CONN_RES/IND/CAP/STEP, a, b]`); **Stamp (1 click)** drops a single-port
+  glyph — **Ring** (`[CONN_CIRCLE,p]`), **Dot** (`[CONN_DOT,p]`), **Gnd**
+  (`[CONN_GROUND,p]`), **Arrow** (`[CONN_ARROW,p]`), **Term** (`[CONN_TERM,p]`),
+  **Cross** (`[CONN_CROSS,p]`); clicking the same port again with a stamp tool removes
+  it. A point may carry **more than one connection** (repeat from the same point);
+  **right-click** a point to remove the most-recent connection touching it. The
+  component/glyph geometry is duplicated from the engine (`drawComponent`/`componentSD`/
+  `drawGlyph`, mirroring `Shapes.pde appendComponent`/`emitGlyph`). The editor shows/edits only the active **tileset**
+  for the current **(shape, k)** (other (shape, k) stay untouched in the file). The
+  **4×4 slot grid** along the bottom (`drawSlotGrid`) shows the active tileset's 16
+  slots (index + weight; the slot being edited is boxed; blank slots are empty) — click
+  one to edit it. Set a weight; **Save** writes the work buffer **into the current slot**
+  (overwrite), **Clear** blanks it. A **Wings** toggle
+  button shows/hides the Carlson wings
+  (`showWings`; square/triangle only — whole hexagons never have wings), so you can
+  judge a motif either as the bare clipped bands or with its connection discs. A
+  **Kumiko** toggle (`kumikoStyle`) previews the motif in the main sketch's Kumiko
+  lattice style — thin uniform strips (`stripWidthFrac`·side, default 0.10) with a
+  square cap + mitered join and wings forced off — so a vertex-port motif (asanoha,
+  etc.) reads as it will render. (The interactive preview, rotations column, and
+  slot grid all share `renderTile`, so they follow both toggles.) A
+  **rotations column** down the right edge shows small
+  thumbnails of every phase the placer can roll (the tile rotated by `k·(2π/n)`,
+  `k = 0..n-1`) — `renderTile(...)` draws both the large interactive tile and the
+  thumbnails. It writes the same `tiles.json` the visualizer loads, so the
+  workflow is: build a tileset in the editor at some k → in the visualizer set
+  **anchors/side to the same k** (Controls / `TRUCHET_ANCHORS`), pick the **tileset**
+  (Tiles-panel selector), and hit **"Reload tiles.json"** (or restart) → the set is in
+  rotation. (The catalog is also read at startup; the Reload button is the live path.)
+  - Headless verification (never screenshot the window): `TILEEDITOR_OUT=path`
+    saves the first fully-drawn frame and exits; `TILEEDITOR_SHAPE` (0/1/2),
+    `TILEEDITOR_ANCHORS` (k), `TILEEDITOR_TILESET` (active tileset index),
+    `TILEEDITOR_SLOT` (0–15), `TILEEDITOR_CONNS` (`"a-b,a-b,..."` port pairs) preload
+    state, `TILEEDITOR_WINGS` (0/1) sets the wings toggle, `TILEEDITOR_KUMIKO` (0/1)
+    sets the Kumiko-strip preview, and `TILEEDITOR_SAVE=1` writes the preloaded buffer
+    into the chosen tileset/slot (creating a tileset if none) and exits (save
+    round-trip test), e.g. `TILEEDITOR_OUT=/tmp/e.png TILEEDITOR_SHAPE=0
+    TILEEDITOR_ANCHORS=2 TILEEDITOR_SLOT=0 TILEEDITOR_CONNS="1-2,3-4,5-6,7-0"`.
+- Being a separate sketch, the editor **duplicates** the few geometry bits it
+  needs (`lineIntersect`, and the vertex/edge-midpoint + band/arc construction
+  copied from `TileWindow.drawArchetype`, including the hub/hump render branches so
+  loaded motifs preview correctly) rather than sharing them. It uses the same
+  `rot`/`R` convention as `drawArchetype`, so a preview matches the Tiles panel and
+  the canvas. Edge indices are rotation-invariant for tiling, so one representative
+  orientation suffices. No connectivity rule is enforced — crossing bands (square
+  `[0,2],[1,3]`) and **multiple connections sharing one edge** are both allowed.
+  `TileWindow`'s
+  in-memory weight edits are *not* persisted; on restart `tiles.json` wins (the
+  editor is the catalog's source of truth).
 
 ## Multi-window architecture (control panels)
 
@@ -622,7 +1002,8 @@ Gotchas that matter when editing this:
   the wrong thread mid-render. `saveTiling()` builds the parameter-stamped filename
   (`saveBaseName()`) and prints the reproduce command (`reproduceCmd()`).
 - **Keep widgets in sync with globals.** `syncParent()` maps sliders/toggles onto
-  `parent.gridN/maxDepth/subdivideProb/winged/invertPerLevel` by index/field; the
+  `parent.*` by **named reference** (`sGrid`, `tgShadow`, …, registered via the
+  `addSlider`/`addToggle`/`addButton` helpers with their owning tab); the
   shape/scheme/palette buttons call the same mutators the keyboard does. If you
   add a tunable global, add a widget here and extend `syncParent()` (or its
   button handler) too, or the panel and keys will drift out of agreement.

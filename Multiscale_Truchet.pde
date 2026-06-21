@@ -104,6 +104,14 @@ float   lineDuty      = 0.45;   // ink fraction of the pitch (line stroke weight
 float   lineSubdivProb = 1.0;   // P(a stroke is subdivided into the line bundle) vs drawn full-thickness; 1 = all lines
 float   bandWidth0    = 0;      // depth-0 band width (side/3 of a root tile); set in rebuildLeaves
 
+// Kumiko (組子) lattice style: render bands as thin uniform mitered strips with no
+// wing discs (the woodwork-lattice look), instead of thick side/3 Truchet bands.
+// Pairs with the vertex (corner) connection ports the tile editor now exposes, so
+// motifs like asanoha (corner -> opposite edge midpoint medians) read correctly.
+// Render-only (no layout rebuild); off => byte-identical to the classic bands.
+boolean kumikoStyle   = false;
+float   stripWidthFrac = 0.10;  // strip width as a fraction of the tile side
+
 // 3D extrusion (graffiti block depth): the foreground ribbons get solid sides
 // extruded toward a vanishing point, viewed head-on. See draw()/drawExtrudeLevel.
 boolean extrude3D     = false;  // master toggle
@@ -140,7 +148,21 @@ PaletteManager palettes;        // colour source (see Palettes.pde), set in setu
 ControlWindow  controls;        // parameter GUI window (see ControlWindow.pde), set in setup()
 TileWindow     tilesWin;        // per-shape tile-weight editor (see TileWindow.pde), set in setup()
 boolean saveRequested = false;  // set by the control window's Save button, handled in draw()
+boolean reloadCatalogRequested = false;  // set by the Tiles panel's Reload button; re-reads tiles.json in draw()
 String  autosavePath  = null;   // TRUCHET_OUT env var: render once to this file, then exit
+boolean manifestLoaded = false; // a render manifest (TRUCHET_LOAD / Load render button) set the state
+boolean controlsNeedSync = false; // ask ControlWindow to refresh its widgets from the globals
+
+// ---- debug logging (TRUCHET_DEBUG / 'd' key) --------------------
+// A thread-tagged action+phase log for tracing the intermittent NullPointerException.
+// The three windows (viz, Controls, Tiles) each run their own thread and mutate the
+// shared globals, so logging the THREAD + last action + render phase is what pins a
+// cross-thread race. All fields are volatile: written/read across those threads.
+volatile boolean debugLog = false;    // gate; near-zero cost when off (dbg early-returns)
+long    debugStartMs = 0;             // millis() at startup, for relative timestamps
+java.io.PrintWriter debugFile = null; // persistent sink (logs/debug-*.log), opened lazily
+volatile String lastAction  = "(none)"; // last user action (set by logAction)
+volatile String renderPhase = "(idle)"; // how far the current draw() got (cheap breadcrumb)
 
 // Layout caching: the tile list + gradient are deterministic from seed/params, so
 // they're rebuilt only when one of those changes (set dirty by the mutators) --
@@ -153,14 +175,371 @@ boolean dirtyGradient = true;
 // way to pair the four edges (gaps/unpaired edges allowed). Each base
 // tile gets a random quarter-turn when placed.
 //   conns: list of {i,j} edge pairs.  TILE_W: relative weights.
+// Edges: 0 = N (top), 1 = E (right), 2 = S (bottom), 3 = W (left).
+//
+// Two connections are NOT plain edge pairs (the 4-edge matching alphabet is
+// otherwise complete -- the 5 entries above exhaust it). They are tagged by a
+// type code in the FIRST slot (>= CONN_TAG, outside any edge index) and dispatched
+// in TileGeom.appendBandsOffset (see Shapes.pde):
+//   { CONN_HUB,  e0, e1, e2, ... } -- a junction: straight spokes from the tile
+//       centre to each listed edge midpoint (a 3-spoke hub = a T/Y; 2 = a band,
+//       4 = the CrossCross +). Spokes enter each edge perpendicular at the central
+//       third, so it stays seamless and multi-scale-safe.
+//   { CONN_HUMP, i, j }            -- an opposite-edge connection drawn as a hump/
+//       arch (raised cosine) instead of a straight band: enters i and j horizontal
+//       (perpendicular) at the central third, bulges toward the perpendicular side.
+final int CONN_TAG    = 100;   // first-slot values >= this are tagged primitives
+final int CONN_HUMP   = 100;   // { CONN_HUMP, i, j }       opposite-edge arch
+final int CONN_HUB    = 101;   // { CONN_HUB, e0, e1, ... } centre-spoke junction
+final int CONN_CIRCLE = 102;   // { CONN_CIRCLE, port }     a ring centred at the port
+final int CONN_DOT     = 103;  // { CONN_DOT, port }        a solid disc (band width) at the port
+// Circuit-inspired motifs. INLINE COMPONENTS join two ports like a wire with a
+// component in the middle (straight leads + a motif); they are decorative (no
+// thirds-invariant guarantee, like adjacent-edge straight bands). POINT GLYPHS
+// stamp a single port and auto-orient toward the tile centre. All are stroked
+// polylines (or a ring), so they flow through every render pass via
+// appendMotifConn -- solid, drop shadow, 3D extrude, and line-mode offset.
+final int CONN_RES    = 104;   // { CONN_RES, a, b }    resistor (zigzag) between two ports
+final int CONN_IND    = 105;   // { CONN_IND, a, b }    inductor (coils) between two ports
+final int CONN_CAP    = 106;   // { CONN_CAP, a, b }    capacitor (gap + plates) between two ports
+final int CONN_STEP   = 107;   // { CONN_STEP, a, b }   stepped (square wave) between two ports
+final int CONN_GROUND = 108;   // { CONN_GROUND, port } ground glyph (stem + 3 bars) at a port
+final int CONN_ARROW  = 109;   // { CONN_ARROW, port }  inward arrowhead glyph at a port
+final int CONN_TERM   = 110;   // { CONN_TERM, port }   open-circle terminal glyph at a port
+final int CONN_CROSS  = 111;   // { CONN_CROSS, port }  plus/cross glyph at a port
+// True for the inline two-port components (decorative wire+component motifs).
+boolean isInlineComp(int code) { return code == CONN_RES || code == CONN_IND || code == CONN_CAP || code == CONN_STEP; }
+// True for the single-port glyphs that auto-orient toward the tile centre.
+boolean isPointGlyph(int code) { return code == CONN_GROUND || code == CONN_ARROW || code == CONN_TERM || code == CONN_CROSS; }
 int[][][] TILE_CONNS = {
-  {                      },   // blank (solid)
-  { {0, 1}               },   // single corner arc (N-E)
-  { {0, 2}               },   // single straight band (N-S)
-  { {0, 1}, {2, 3}       },   // two diagonal arcs  (N-E + S-W)
-  { {0, 2}, {1, 3}       },   // two crossing bands (N-S + E-W)
+  {                      },          // blank (solid)
+  { {0, 1}               },          // single corner arc (N-E)
+  { {0, 2}               },          // single straight band (N-S)
+  { {0, 1}, {2, 3}       },          // two diagonal arcs  (N-E + S-W)
+  { {0, 2}, {1, 3}       },          // two crossing bands (N-S + E-W)
+  { {CONN_HUB, 0, 2, 1}  },          // T / Y junction (N-S bar + E spoke)
+  { {CONN_HUMP, 3, 1}    },          // arch / hump (W-E, bulging toward N)
 };
-float[] TILE_W = { 0.4, 1.0, 1.0, 6.0, 2.0 };
+float[] TILE_W = { 0.4, 1.0, 1.0, 6.0, 2.0, 1.5, 1.5 };
+
+// ---- shared tile catalog: named 16-tile TILESETS (tiles.json) ---
+// A TILESET is exactly TILESET_SIZE (16) tile slots that share one shape (n sides)
+// and one anchors-per-side (k). Blank slots are an empty conns[] with weight 0. The
+// catalog (tiles.json) holds any number of tilesets; per (shape, k) there may be
+// several, and the user selects which one is active (Tiles panel / TRUCHET_TILESET).
+//
+// The hardcoded square alphabet above (TILE_CONNS/TILE_W) and TRI_*/HEX_* in
+// Shapes.pde are the built-in DEFAULTS, used only to SEED a fresh tiles.json (one
+// k = 1 tileset per shape). At runtime, rendering routes through the active tileset
+// via connsFor()/weightsFor(); the standalone editor (TileEditor/TileEditor.pde)
+// authors tilesets into the same file. If tiles.json is missing it is seeded; if it
+// is an old (v1) flat catalog it is backed up and replaced with a fresh v2 seed.
+// The trapezoid (port-based, bespoke arc specs) is intentionally NOT catalogued.
+//
+// A connection inside a tile is a JSON array of ints: a plain {i,j} edge/port pair,
+// OR a tagged primitive {CONN_HUB,...}/{CONN_HUMP,i,j}/{CONN_CIRCLE,p}/{CONN_DOT,p}
+// -- any length is preserved. k must be uniform across a tiling to connect, so it is
+// a global render parameter (anchorsPerSide), not per-tile.
+String tilesJsonPath()   { return sketchPath("tiles.json"); }
+String tilesBackupPath() { return sketchPath("tiles.v1.backup.json"); }
+
+final int TILESET_SIZE = 16;                         // a tileset is exactly 16 slots (4x4)
+int anchorsPerSide = 1;                              // global k; TRUCHET_ANCHORS / Controls
+
+// One tileset: 16 slots (conns + weight) for one (sides n, anchors k).
+class Tileset {
+  int sides, anchors;
+  int[][][] conns;                                   // length TILESET_SIZE; conns[i] = motif i
+  float[]   weights;                                 // length TILESET_SIZE
+  Tileset(int sides, int anchors) {
+    this.sides = sides; this.anchors = anchors;
+    conns   = new int[TILESET_SIZE][][];
+    weights = new float[TILESET_SIZE];
+    for (int i = 0; i < TILESET_SIZE; i++) { conns[i] = new int[0][]; weights[i] = 0; }
+  }
+}
+
+HashMap<String,ArrayList<Tileset>> tilesetsByNK   = new HashMap<String,ArrayList<Tileset>>(); // key "n_k"
+HashMap<String,Integer>            activeTilesetIdx = new HashMap<String,Integer>();           // key "n_k" -> active index
+final int[][][] BLANK_CONNS = { { } };               // fallback when no tileset exists for (n,k) yet
+final float[]   BLANK_W     = { 1 };
+
+String nkKey(int n, int k) { return n + "_" + k; }
+int curN() { return shapeMode == 1 ? 3 : (shapeMode == 2 ? 6 : 4); }  // current shape's polygon n (trapezoid -> 4)
+boolean shapeUsesTilesets() { return shapeMode != 3; }                // trapezoid is bespoke (TRAP_*)
+
+ArrayList<Tileset> tilesetsFor(int n, int k) { return tilesetsByNK.get(nkKey(n, k)); }
+int activeIdxFor(int n, int k) { Integer v = activeTilesetIdx.get(nkKey(n, k)); return v == null ? 0 : v; }
+
+// The active tileset for shape n at the current k, or null if that (n,k) has none.
+Tileset activeTilesetFor(int n) {
+  ArrayList<Tileset> list = tilesetsFor(n, anchorsPerSide);
+  if (list == null || list.isEmpty()) return null;
+  return list.get(constrain(activeIdxFor(n, anchorsPerSide), 0, list.size() - 1));
+}
+
+// Tileset count / 1-based active ordinal for the CURRENT (shape, k) -- drives the Tiles-panel label.
+int tilesetCount() {
+  if (!shapeUsesTilesets()) return 0;
+  ArrayList<Tileset> list = tilesetsFor(curN(), anchorsPerSide);
+  return list == null ? 0 : list.size();
+}
+int activeTilesetOrdinal() {
+  int c = tilesetCount();
+  return c == 0 ? 0 : constrain(activeIdxFor(curN(), anchorsPerSide), 0, c - 1) + 1;
+}
+// Step the active tileset for the current (shape, k); wraps. Sets dirtyLayout.
+void setActiveTileset(int dir) {
+  int c = tilesetCount();
+  if (c == 0) return;
+  String key = nkKey(curN(), anchorsPerSide);
+  int idx = (activeIdxFor(curN(), anchorsPerSide) + dir + c) % c;
+  activeTilesetIdx.put(key, idx);
+  logAction("TILESET active -> " + (idx + 1) + "/" + c);
+  dirtyLayout = true;
+}
+
+// Load the shared tiles.json. Missing -> seed a fresh v2 default. Old (v1) flat
+// catalog -> back it up and replace with a fresh seed (start fresh, do not migrate).
+// Always applyCatalog() so the runtime tilesetsByNK map is populated.
+void loadTileCatalog() {
+  File f = new File(tilesJsonPath());
+  if (!f.exists()) {                                 // seed the shared file from built-in defaults
+    JSONObject fresh = defaultCatalogJson();
+    saveJSONObject(fresh, tilesJsonPath());
+    applyCatalog(fresh);
+    return;
+  }
+  JSONObject cat = loadJSONObject(tilesJsonPath());
+  if (cat == null) { applyCatalog(defaultCatalogJson()); return; }   // unreadable -> in-memory default
+  if (cat.getInt("version", 1) < 2 || !cat.hasKey("tilesets")) {     // old flat format -> back up + reseed
+    saveJSONObject(cat, tilesBackupPath());
+    println("backed up old tiles.json -> " + tilesBackupPath());
+    JSONObject fresh = defaultCatalogJson();
+    saveJSONObject(fresh, tilesJsonPath());
+    applyCatalog(fresh);
+    return;
+  }
+  applyCatalog(cat);
+}
+
+// Overwrite the in-memory tilesets from a catalog object (v2 tiles.json schema).
+// Used by loadTileCatalog() (the shared file) and loadManifest() (the catalog
+// embedded in a render manifest). A v1 (flat) catalog is converted on the fly so
+// old manifests still reproduce. connsFor()/weightsFor() and the Tiles panel read
+// the tilesets by reference, so the change propagates everywhere.
+void applyCatalog(JSONObject cat) {
+  tilesetsByNK.clear();
+  JSONObject v2 = cat.hasKey("tilesets") ? cat : v1ToV2(cat);
+  JSONArray sets = v2.getJSONArray("tilesets");
+  for (int i = 0; i < sets.size(); i++) {
+    Tileset ts = jsonToTileset(sets.getJSONObject(i));
+    String key = nkKey(ts.sides, ts.anchors);
+    if (!tilesetsByNK.containsKey(key)) tilesetsByNK.put(key, new ArrayList<Tileset>());
+    tilesetsByNK.get(key).add(ts);
+  }
+  if (cat.hasKey("trapezoid")) {                     // weights only; conns are hardcoded (TRAP_CONNS)
+    float[] tw = jsonToWeights(cat.getJSONArray("trapezoid"));
+    if (tw.length == TRAP_W.length) TRAP_W = tw;
+  }
+  for (String key : tilesetsByNK.keySet()) {         // clamp any now-stale active selection
+    int c = tilesetsByNK.get(key).size();
+    Integer idx = activeTilesetIdx.get(key);
+    if (idx != null && idx >= c) activeTilesetIdx.put(key, 0);
+  }
+}
+
+// One tileset JSON object -> a Tileset (always padded/truncated to TILESET_SIZE slots).
+Tileset jsonToTileset(JSONObject o) {
+  int sides   = o.getInt("sides", 4);
+  int anchors = max(1, o.getInt("anchors", 1));
+  Tileset ts  = new Tileset(sides, anchors);
+  JSONArray tiles = o.hasKey("tiles") ? o.getJSONArray("tiles") : new JSONArray();
+  int n = min(TILESET_SIZE, tiles.size());
+  for (int i = 0; i < n; i++) {
+    JSONObject m  = tiles.getJSONObject(i);
+    JSONArray  cs = m.hasKey("conns") ? m.getJSONArray("conns") : new JSONArray();
+    int[][] conns = new int[cs.size()][];
+    for (int c = 0; c < cs.size(); c++) {
+      JSONArray pair = cs.getJSONArray(c);
+      int[] arr = new int[pair.size()];
+      for (int t = 0; t < pair.size(); t++) arr[t] = pair.getInt(t);
+      conns[c] = arr;
+    }
+    ts.conns[i]   = conns;
+    ts.weights[i] = m.getFloat("weight", 0);
+  }
+  return ts;
+}
+
+// A Tileset -> its JSON object (shape/sides/anchors + 16 {conns, weight} tiles).
+JSONObject tilesetToJson(Tileset ts) {
+  JSONObject o = new JSONObject();
+  o.setString("shape", shapeKeyFor(ts.sides));
+  o.setInt("sides",   ts.sides);
+  o.setInt("anchors", ts.anchors);
+  JSONArray tiles = new JSONArray();
+  for (int i = 0; i < TILESET_SIZE; i++) {
+    JSONObject m  = new JSONObject();
+    JSONArray  cs = new JSONArray();
+    int[][] conns = (i < ts.conns.length && ts.conns[i] != null) ? ts.conns[i] : new int[0][];
+    for (int c = 0; c < conns.length; c++) {
+      JSONArray pair = new JSONArray();
+      for (int t = 0; t < conns[c].length; t++) pair.setInt(t, conns[c][t]);
+      cs.setJSONArray(c, pair);
+    }
+    m.setJSONArray("conns", cs);
+    m.setFloat("weight", i < ts.weights.length ? ts.weights[i] : 0);
+    tiles.setJSONObject(i, m);
+  }
+  o.setJSONArray("tiles", tiles);
+  return o;
+}
+
+String shapeKeyFor(int sides) { return sides == 3 ? "triangle" : (sides == 6 ? "hexagon" : "square"); }
+
+// Fresh v2 catalog: one k = 1 tileset per shape, seeded from the built-in alphabets
+// and padded to 16 slots. Other (shape, k) combos start empty (authored in the editor).
+JSONObject defaultCatalogJson() {
+  JSONObject cat = new JSONObject();
+  cat.setInt("version", 2);
+  JSONArray sets = new JSONArray();
+  sets.setJSONObject(sets.size(), seedTilesetJson("square",   4, TILE_CONNS, TILE_W));
+  sets.setJSONObject(sets.size(), seedTilesetJson("triangle", 3, TRI_CONNS,  TRI_W));
+  sets.setJSONObject(sets.size(), seedTilesetJson("hexagon",  6, HEX_CONNS,  HEX_W));
+  cat.setJSONArray("tilesets", sets);
+  return cat;
+}
+
+// Build a 16-slot tileset JSON from a built-in alphabet (extra slots blank, weight 0).
+JSONObject seedTilesetJson(String shape, int n, int[][][] conns, float[] w) {
+  JSONObject o = new JSONObject();
+  o.setString("shape", shape);
+  o.setInt("sides", n);
+  o.setInt("anchors", 1);
+  JSONArray tiles = new JSONArray();
+  for (int i = 0; i < TILESET_SIZE; i++) {
+    JSONObject m  = new JSONObject();
+    JSONArray  cs = new JSONArray();
+    if (i < conns.length) {
+      for (int c = 0; c < conns[i].length; c++) {
+        JSONArray pair = new JSONArray();
+        for (int t = 0; t < conns[i][c].length; t++) pair.setInt(t, conns[i][c][t]);
+        cs.setJSONArray(c, pair);
+      }
+    }
+    m.setJSONArray("conns", cs);
+    m.setFloat("weight", (i < conns.length) ? (i < w.length ? w[i] : 1.0) : 0);
+    tiles.setJSONObject(i, m);
+  }
+  o.setJSONArray("tiles", tiles);
+  return o;
+}
+
+// Reflects the CURRENT in-memory state: every tileset (all shapes, all k) plus the
+// trapezoid weights. Embedded in a render manifest so reproduction does not depend on
+// tiles.json staying put.
+JSONObject currentCatalogJson() {
+  JSONObject cat = new JSONObject();
+  cat.setInt("version", 2);
+  JSONArray sets = new JSONArray();
+  for (String key : tilesetsByNK.keySet())
+    for (Tileset ts : tilesetsByNK.get(key))
+      sets.setJSONObject(sets.size(), tilesetToJson(ts));
+  cat.setJSONArray("tilesets", sets);
+  cat.setJSONArray("trapezoid", connsToJson(TRAP_CONNS, TRAP_W, 4));
+  return cat;
+}
+
+// Convert an old (v1) flat catalog -> v2 tilesets (best-effort, for old manifests).
+// Each (shape, k) group is split into 16-tile tilesets, padding the last with blanks.
+JSONObject v1ToV2(JSONObject v1) {
+  JSONObject out = new JSONObject();
+  out.setInt("version", 2);
+  JSONArray sets = new JSONArray();
+  addV1Shape(sets, v1, "square",   4);
+  addV1Shape(sets, v1, "triangle", 3);
+  addV1Shape(sets, v1, "hexagon",  6);
+  out.setJSONArray("tilesets", sets);
+  return out;
+}
+void addV1Shape(JSONArray sets, JSONObject v1, String key, int n) {
+  if (!v1.hasKey(key)) return;
+  JSONArray a = v1.getJSONArray(key);
+  HashMap<Integer,ArrayList<JSONObject>> byK = new HashMap<Integer,ArrayList<JSONObject>>();
+  for (int i = 0; i < a.size(); i++) {
+    JSONObject m = a.getJSONObject(i);
+    int k = max(1, m.getInt("anchors", 1));
+    if (!byK.containsKey(k)) byK.put(k, new ArrayList<JSONObject>());
+    byK.get(k).add(m);
+  }
+  for (Integer k : byK.keySet()) {
+    ArrayList<JSONObject> motifs = byK.get(k);
+    for (int start = 0; start < motifs.size(); start += TILESET_SIZE) {
+      JSONObject ts = new JSONObject();
+      ts.setString("shape", key);
+      ts.setInt("sides", n);
+      ts.setInt("anchors", k);
+      JSONArray tiles = new JSONArray();
+      for (int s = 0; s < TILESET_SIZE; s++) {
+        int src = start + s;
+        JSONObject tile = new JSONObject();
+        if (src < motifs.size()) {
+          tile.setJSONArray("conns", motifs.get(src).getJSONArray("conns"));
+          tile.setFloat("weight", motifs.get(src).getFloat("weight", 1.0));
+        } else {
+          tile.setJSONArray("conns", new JSONArray());
+          tile.setFloat("weight", 0);
+        }
+        tiles.setJSONObject(s, tile);
+      }
+      ts.setJSONArray("tiles", tiles);
+      sets.setJSONObject(sets.size(), ts);
+    }
+  }
+}
+
+// JSON array of motifs -> the int[][][] alphabet (each conn is a variable-length int[]).
+int[][][] jsonToConns(JSONArray shape) {
+  int[][][] out = new int[shape.size()][][];
+  for (int i = 0; i < shape.size(); i++) {
+    JSONArray cs = shape.getJSONObject(i).getJSONArray("conns");
+    int[][] conns = new int[cs.size()][];
+    for (int k = 0; k < cs.size(); k++) {
+      JSONArray c = cs.getJSONArray(k);
+      int[] pair = new int[c.size()];
+      for (int t = 0; t < c.size(); t++) pair[t] = c.getInt(t);
+      conns[k] = pair;
+    }
+    out[i] = conns;
+  }
+  return out;
+}
+
+float[] jsonToWeights(JSONArray shape) {
+  float[] w = new float[shape.size()];
+  for (int i = 0; i < shape.size(); i++) w[i] = shape.getJSONObject(i).getFloat("weight", 1.0);
+  return w;
+}
+
+JSONArray connsToJson(int[][][] conns, float[] w, int sides) {
+  JSONArray arr = new JSONArray();
+  for (int i = 0; i < conns.length; i++) {
+    JSONObject m  = new JSONObject();
+    JSONArray  cs = new JSONArray();
+    for (int k = 0; k < conns[i].length; k++) {
+      JSONArray c = new JSONArray();
+      for (int t = 0; t < conns[i][k].length; t++) c.setInt(t, conns[i][k][t]);
+      cs.setJSONArray(k, c);
+    }
+    m.setJSONArray("conns", cs);
+    m.setFloat("weight", (i < w.length) ? w[i] : 1.0);
+    m.setInt("sides", sides);
+    m.setInt("anchors", 1);
+    arr.setJSONObject(i, m);
+  }
+  return arr;
+}
 
 // ---- leaves (the Tile polygon is defined in Shapes.pde) --------
 ArrayList<Tile> leaves;
@@ -193,8 +572,11 @@ void settings() {
 }
 
 void setup() {
+  debugStartMs = millis();           // base for relative debug timestamps
+  if ("1".equals(System.getenv("TRUCHET_DEBUG"))) enableDebug(true);  // log everything from startup
   palettes = new PaletteManager();   // built-in COLOURlovers snapshot
   initAnim();                        // animation engine (LFOs, registry) — see Animation.pde
+  loadTileCatalog();                 // shared tiles.json -> overwrites the square/tri/hex alphabets (seeds the file if absent)
   noLoop();
 
   // Headless one-shot render (for verifying changes from the command line —
@@ -203,6 +585,11 @@ void setup() {
   // to TRUCHET_OUT and the sketch exits. Example:
   //   TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 processing-java --sketch=... --run
   autosavePath = System.getenv("TRUCHET_OUT");
+  // TRUCHET_LOAD: restore a full render manifest as the baseline state (the complete,
+  // reproducible recipe -- globals + tile catalog + palette). Parsed first so any
+  // explicit TRUCHET_* override below still wins (e.g. load a frame, bump TRUCHET_SCALE).
+  String envLoad = System.getenv("TRUCHET_LOAD");
+  if (envLoad != null) loadManifest(envLoad.trim());
   String envShape  = System.getenv("TRUCHET_SHAPE");   // 0 square, 1 triangle, 2 hexagon, 3 trapezoid
   if (envShape != null)  shapeMode   = constrain(Integer.parseInt(envShape.trim()), 0, 3);
   String envScheme = System.getenv("TRUCHET_SCHEME");  // 0..4, see schemeName()
@@ -246,12 +633,20 @@ void setup() {
   if (envLineD != null)  lineDuty    = constrain(Float.parseFloat(envLineD.trim()), 0.05, 0.95);
   String envLineS  = System.getenv("TRUCHET_LINE_SUBDIV"); // P(stroke subdivided into lines) vs full thickness
   if (envLineS != null)  lineSubdivProb = constrain(Float.parseFloat(envLineS.trim()), 0.0, 1.0);
+  String envKum    = System.getenv("TRUCHET_KUMIKO");      // 0/1: thin mitered Kumiko-lattice strips
+  if (envKum != null)    kumikoStyle = !envKum.trim().equals("0");
+  String envStrip  = System.getenv("TRUCHET_STRIP");       // Kumiko strip width (fraction of side)
+  if (envStrip != null)  stripWidthFrac = constrain(Float.parseFloat(envStrip.trim()), 0.01, 0.33);
   String envGrid   = System.getenv("TRUCHET_GRID");    // top-level cells per side
   if (envGrid != null)   gridN       = constrain(Integer.parseInt(envGrid.trim()), 2, 16);
   String envDepth  = System.getenv("TRUCHET_DEPTH");   // max subdivisions (0 = single scale)
   if (envDepth != null)  maxDepth    = constrain(Integer.parseInt(envDepth.trim()), 0, 6);
   String envSub    = System.getenv("TRUCHET_SUBDIV");  // subdivide probability (0..1; 1 = uniform fine)
   if (envSub != null)    subdivideProb = constrain(Float.parseFloat(envSub.trim()), 0, 1);
+  String envAnch   = System.getenv("TRUCHET_ANCHORS"); // anchor points per side (k); 1 = classic
+  if (envAnch != null)   anchorsPerSide = constrain(Integer.parseInt(envAnch.trim()), 1, 4);
+  String envTset   = System.getenv("TRUCHET_TILESET"); // active tileset index for the current (shape, k)
+  if (envTset != null)   activeTilesetIdx.put(nkKey(curN(), anchorsPerSide), max(0, Integer.parseInt(envTset.trim())));
   String envEx     = System.getenv("TRUCHET_EXTRUDE");      // 0/1: 3D extrusion off/on
   if (envEx != null)     extrude3D   = !envEx.trim().equals("0");
   String envExMode = System.getenv("TRUCHET_EXTRUDE_MODE"); // 0 oblique, 1 one-point
@@ -303,6 +698,10 @@ void setup() {
     return;                            // no GUI windows in headless mode
   }
 
+  // The interactive app opens with the active tileset's authored weights (selecting a
+  // curated 16-tile set is the point), so there is no blank-slate reset here. Tweak the
+  // mix live with the Tiles-panel sliders, or switch tilesets with its selector.
+
   // launch the GUIs as separate PApplet windows. Each holds a reference back
   // here, edits the globals above, and calls redraw() (the viz is noLoop()).
   controls = new ControlWindow(this);
@@ -312,13 +711,27 @@ void setup() {
 }
 
 void draw() {
+ try {
   // 0. animation: advance the clock + refresh the modulator snapshot the render
   //    reads (identity when animation is off, so a static frame is unchanged).
+  phase("updateAnim");
   updateAnim();
+
+  // Tiles panel "Reload" button: re-read tiles.json on the viz thread (so the
+  // catalog arrays are not swapped mid-render). loadTileCatalog reassigns the
+  // alphabet/weight globals in place, so connsFor/weightsFor and the panels pick
+  // up the new sets by reference; rebuild the tiling to apply them.
+  if (reloadCatalogRequested) {
+    phase("reloadCatalog");
+    loadTileCatalog();
+    reloadCatalogRequested = false;
+    dirtyLayout = true;
+  }
 
   // gradient + layout are deterministic from seed/params -> rebuild only when a
   // mutator marked them dirty, not every animated frame.
   if (dirtyGradient) {
+    phase("setupGradient");
     randomSeed(seedVal);
     setupGradient();              // pick the gradient scheme's colours (uses random)
     dirtyGradient = false;
@@ -339,28 +752,33 @@ void draw() {
   // the canvas, builds its own leaves and draws them (see ImageMode.pde) -- so it
   // replaces the normal background + build + render + symmetry block below.
   if (imageMode) {
+    phase("imageMode");
     drawImageMode();
   } else {
+    phase("background");
     if (colorScheme == 3) drawGradientBackground();   // smooth gradient fills the canvas
     else background(canvasBgColor());
 
     // 1. build the leaf tiling (cached; see rebuildLeaves).
-    if (dirtyLayout) { rebuildLeaves(); dirtyLayout = false; }
+    if (dirtyLayout) { phase("rebuildLeaves"); rebuildLeaves(); dirtyLayout = false; }
 
     // 2. draw the tiling coarse-first (see renderTiling).
+    phase("renderTiling");
     renderTiling();
 
     // 3. mirror symmetry (modes 1-3): reflect the rendered pixels about
     //    grid-aligned axes. (Mode 4, rot 180, is tile-level -- see step 1.)
+    phase("applySymmetry");
     applySymmetry();
 
     // 3b. optional: overlay the base (root) tile lattice on top of everything.
-    if (showGrid) drawGridOverlay();
+    if (showGrid) { phase("gridOverlay"); drawGridOverlay(); }
   }
 
   // 4. honour a save request from the control window (run here, on the
   // viz thread, so the saved frame is the fully drawn one).
   if (saveRequested) {
+    phase("saveTiling");
     saveTiling();
     saveRequested = false;
   }
@@ -369,11 +787,19 @@ void draw() {
   // parameter-stamped name + reproduce command for this frame (handy for scripting
   // and for confirming the GUI's filename scheme).
   if (autosavePath != null) {
+    phase("autosave");
     save(autosavePath);
+    saveManifest(autosavePath);          // sidecar JSON beside the PNG (TRUCHET_LOAD reproduces it)
     println("name: " + saveBaseName());
     println("reproduce: " + reproduceCmd(saveBaseName()));
     exit();
   }
+  phase("(idle)");
+ } catch (Throwable e) {
+  // The primary crash catch (viz thread). Dump thread + last action + phase + state
+  // + stack trace to console and the log file, then stop the loop (see dbgCrash).
+  dbgCrash(e);
+ }
 }
 
 // Draw the global `leaves` coarse-first so finer tiles + wings land on top. Each
@@ -506,6 +932,14 @@ float[] lineOffsets(float w) {
   float[] off = new float[nL];
   for (int i = 0; i < nL; i++) off[i] = (i - (nL - 1) / 2.0) * linePitch();
   return off;
+}
+// Width the line-mode parallel-line bundle spreads across, centred on the band
+// centre-line: the set strip width (stripWidthFrac * side), clamped to the band
+// so lines never spill past the band region (and the opaque ribbon base). The
+// pitch stays constant (lineCount-driven), so density reads uniform across scales
+// and the wing rings stay phase-aligned -- only the spread tracks the strip width.
+float lineBundleW(TileGeom gm) {
+  return min(stripWidthFrac * gm.side, gm.bandW) * animBandScale;
 }
 
 void rebuildLeaves() {
@@ -766,12 +1200,12 @@ void pickSymmetricMotifMulti(Tile t, boolean onV, boolean onH) {
   float total = 0;
   for (int mi = 0; mi < alpha.length; mi++)
     for (int mk = 0; mk < n; mk++) {
-      if (onV && !selfMirrorMotif(alpha[mi], mk, c0V, n)) continue;
-      if (onH && !selfMirrorMotif(alpha[mi], mk, c0H, n)) continue;
+      if (onV && !selfMirrorMotif(alpha[mi], mk, c0V, n, max(1, anchorsPerSide))) continue;
+      if (onH && !selfMirrorMotif(alpha[mi], mk, c0H, n, max(1, anchorsPerSide))) continue;
       cand.add(new int[]{ mi, mk });
       total += w[mi];
     }
-  if (cand.isEmpty() || total <= 0) { t.mi = 0; t.mk = 0; return; }
+  if (cand.isEmpty() || total <= 0) { t.mi = -1; t.mk = 0; return; }   // none qualify -> blank
   float r = random(total);
   int[] pick = cand.get(cand.size() - 1);
   for (int[] cm : cand) {
@@ -782,20 +1216,51 @@ void pickSymmetricMotifMulti(Tile t, boolean onV, boolean onH) {
   t.mk = pick[1];
 }
 
-// Does the motif (connection set rotated by mk) map onto itself under the
-// edge reflection e -> c0 - 1 - e?
-boolean selfMirrorMotif(int[][] conns, int mk, int c0, int n) {
-  boolean[][] has = new boolean[n][n];
+// Does the motif (connection set rotated by mk) map onto itself under the axis
+// reflection? Works over PORTS (k anchors per side; k=1 = the classic single
+// midpoint, identical to before). The reflection maps a port (edge e, slot s) to
+// (edge c0-1-e, slot k-1-s): the edge reflects by e -> c0-1-e and, because a
+// reflection reverses the anchor order along an edge, the slot reverses too. A
+// rotation by mk steps maps (e,s) -> (e+mk, s) (slot preserved). Tagged primitives
+// (hub/hump, first slot >= CONN_TAG; k=1 only) never qualify -- a straddler then
+// falls back to a plain symmetric motif.
+boolean selfMirrorMotif(int[][] conns, int mk, int c0, int n, int k) {
+  int vbase = n * k + n + 1;             // vertex (corner) ports start here
   for (int[] c : conns) {
-    int i = (c[0] + mk) % n, j = (c[1] + mk) % n;
+    if (c[0] >= CONN_TAG) return false;                 // tagged prims (hub/hump/circle/dot)
+    if (c[0] >= vbase || c[1] >= vbase) return false;   // vertex-port (Kumiko) motifs: rotPort/
+                                                        // reflPort don't map corners -> skip straddlers
+  }
+  int P = n * k + n + 1;                 // edge anchors + apothem mids + centre
+  boolean[][] has = new boolean[P][P];
+  for (int[] c : conns) {
+    int i = rotPort(c[0], mk, n, k), j = rotPort(c[1], mk, n, k);
     has[i][j] = has[j][i] = true;
   }
   for (int[] c : conns) {
-    int i = ((c0 - 1 - c[0] - mk) % n + n) % n;
-    int j = ((c0 - 1 - c[1] - mk) % n + n) % n;
+    int i = reflPort(rotPort(c[0], mk, n, k), c0, n, k);
+    int j = reflPort(rotPort(c[1], mk, n, k), c0, n, k);
     if (!has[i][j]) return false;
   }
   return true;
+}
+
+// Port transforms used by the straddler self-symmetry test. Edge port p encodes
+// (edge e = p/k, slot s = p%k). rotPort spins by mk edge-steps (slot kept);
+// reflPort reflects across the edge origin c0 (slot reversed: s -> k-1-s).
+// Interior ports: an apothem midpoint (n*k + e) follows its edge e; the centre
+// (n*k + n) is fixed by every rotation/reflection.
+int rotPort(int p, int mk, int n, int k) {
+  int E = n * k;
+  if (p < E)     { int e = p / k, s = p % k; return ((e + mk) % n) * k + s; }
+  if (p < E + n) return E + (p - E + mk) % n;
+  return p;
+}
+int reflPort(int p, int c0, int n, int k) {
+  int E = n * k;
+  if (p < E)     { int e = p / k, s = p % k; return (((c0 - 1 - e) % n + n) % n) * k + (k - 1 - s); }
+  if (p < E + n) return E + ((c0 - 1 - (p - E)) % n + n) % n;
+  return p;
 }
 
 // ---- colour from the active palette -----------------------------
@@ -983,10 +1448,19 @@ color ribbonColor(Palette p, int depth) {
 // or the S key) so the grabbed frame is fully drawn.
 void saveTiling() {
   String base = saveBaseName();
-  saveFrame(base + ".png");                 // written to the sketch folder
-  println("saved " + base + ".png");
+  String path = renderDir() + base + ".png";
+  saveFrame(path);                          // Processing creates hires/ if absent
+  saveManifest(path);                       // sidecar JSON: the complete reproducible recipe
+  println("saved " + path);
   println("reproduce at higher resolution (raise/lower TRUCHET_SCALE for the size):");
   println("  " + reproduceCmd(base));
+}
+
+// Saved renders go in a single flat hires/ folder (gitignored) to keep the sketch
+// root uncluttered; the parameter-stamped filename is the index. Relative to the
+// sketch folder. (TRUCHET_OUT headless renders still honour their explicit path.)
+String renderDir() {
+  return "hires/";
 }
 
 // Compact, human-readable parameter summary for the filename. Captures the knobs
@@ -1002,18 +1476,52 @@ String saveBaseName() {
       if (dot > 0) b = b.substring(0, dot);
       s += "_" + b.replaceAll("[^A-Za-z0-9._-]", "");
     }
-    return s;
+    return s + appearanceTokens();
   }
   s = "truchet_" + SHAPE_NAMES[shapeMode] + "_" + schemeName(colorScheme)
     + "_seed" + seedVal + "_g" + gridN + "_d" + maxDepth
     + "_sub" + round(subdivideProb * 100) + "_pal" + palettes.current;
   if (symmetryMode != 0) s += "_sym" + symmetryMode;
+  return s + appearanceTokens();
+}
+
+// Appearance/colour tokens shared by both render modes. Each is emitted ONLY when
+// it deviates from its setup() default, so a default render keeps a short name yet
+// any tweak a headless re-render would otherwise miss is captured -- making the
+// filename a faithful spec, not just an index. (reproduceCmd() lists every
+// parameter unconditionally; this is the subset that differs from default.)
+// Continuous values are encoded as integer percent / degrees, e.g. line duty 0.40
+// -> "d40", line subdiv 0.80 -> "s80", shadow 0.3/0.4/45deg -> "sh30-40-45".
+String appearanceTokens() {
+  String s = "";
+  if (anchorsPerSide != 1) s += "_k" + anchorsPerSide;              // multi-anchor tile alphabet
+  if (duoRandom)         s += "_duo" + duoBgIdx + "-" + duoFgIdx;   // R-key random fg/bg (duotone)
   if (!winged)           s += "_nowing";
   if (!dropShadow)       s += "_noshadow";
-  else if (shadowGlobal) s += "_gshadow";
+  else {
+    if (shadowGlobal)    s += "_gshadow";
+    if (round(shadowStrength * 100) != 30 || round(shadowSize * 100) != 40
+        || round(degrees(shadowAngle)) != 45)
+      s += "_sh" + round(shadowStrength * 100) + "-" + round(shadowSize * 100)
+         + "-" + round(degrees(shadowAngle));
+  }
   if (!invertPerLevel)   s += "_noinv";
-  if (extrude3D)         s += "_ext" + extrudeMode;
-  if (lineMode)          s += "_line" + lineCount;
+  if (extrude3D) {
+    s += "_ext" + extrudeMode;
+    if (round(vpX * 100) != 50 || round(vpY * 100) != -20
+        || round(extrudeDepth * 100) != 50 || round(extrudeShade * 100) != 55)
+      s += "_vp" + round(vpX * 100) + "_" + round(vpY * 100)
+         + "_ed" + round(extrudeDepth * 100) + "_es" + round(extrudeShade * 100);
+  }
+  if (lineMode) {
+    s += "_line" + lineCount;                                      // lineCount is always shown
+    if (round(lineDuty * 100) != 45)        s += "d" + round(lineDuty * 100);
+    if (round(lineSubdivProb * 100) != 100) s += "s" + round(lineSubdivProb * 100);
+  }
+  if (kumikoStyle) {
+    s += "_kumiko";
+    if (round(stripWidthFrac * 100) != 10) s += round(stripWidthFrac * 100);   // strip width %
+  }
   return s;
 }
 
@@ -1026,11 +1534,15 @@ String reproduceCmd(String base) {
     + " TRUCHET_SHAPE="  + shapeMode
     + " TRUCHET_SCHEME=" + colorScheme
     + " TRUCHET_PALETTE=" + palettes.current
+    + " TRUCHET_ANCHORS=" + anchorsPerSide
+    + " TRUCHET_TILESET=" + activeIdxFor(curN(), anchorsPerSide)
     + " TRUCHET_INVERT=" + (invertPerLevel ? 1 : 0)
     + " TRUCHET_LINE=" + (lineMode ? 1 : 0)
     + " TRUCHET_LINE_COUNT=" + lineCount
     + " TRUCHET_LINE_DUTY=" + nf(lineDuty, 1, 2)
     + " TRUCHET_LINE_SUBDIV=" + nf(lineSubdivProb, 1, 2)
+    + " TRUCHET_KUMIKO=" + (kumikoStyle ? 1 : 0)
+    + " TRUCHET_STRIP=" + nf(stripWidthFrac, 1, 2)
     + (duoRandom ? " TRUCHET_DUO=" + duoBgIdx + "," + duoFgIdx : "");
   if (imageMode && imagePath != null) {
     cmd += " TRUCHET_IMG=" + imagePath
@@ -1064,13 +1576,235 @@ String reproduceCmd(String base) {
         + " TRUCHET_EXTRUDE_SHADE=" + nf(extrudeShade, 1, 2);
     }
   }
-  cmd += " TRUCHET_OUT=" + base + "_hires.png"
+  cmd += " TRUCHET_OUT=" + renderDir() + base + "_hires.png"
     + " processing-java --sketch=" + sketchPath("") + " --run";
   return cmd;
 }
 
+// ---- render manifest (the complete, reproducible recipe) --------
+// The filename is a lossy human index and reproduceCmd() is env-only; both omit the
+// three pieces of implicit state that bit us before -- tile weights, anchors-per-side,
+// and palette rotation. A manifest is the authoritative recipe: every render global
+// PLUS the exact tile catalog (alphabets + weights) and palette colour order, written
+// as a JSON sidecar beside each saved PNG. loadManifest() restores it all, so the
+// composition reproduces regardless of later tiles.json edits -- at any resolution
+// (TRUCHET_SCALE/W/H stay env-only, since they are output size, not composition).
+JSONObject renderManifest() {
+  JSONObject root = new JSONObject();
+  root.setInt("version", 1);
+  root.setString("name", saveBaseName());
+
+  JSONObject r = new JSONObject();
+  r.setInt("shape", shapeMode);          r.setInt("scheme", colorScheme);
+  r.setInt("seed", seedVal);             r.setInt("grid", gridN);
+  r.setInt("depth", maxDepth);           r.setFloat("subdiv", subdivideProb);
+  r.setInt("sym", symmetryMode);         r.setInt("anchors", anchorsPerSide);
+  r.setBoolean("winged", winged);        r.setBoolean("invert", invertPerLevel);
+  r.setBoolean("showGrid", showGrid);
+  r.setBoolean("duoRandom", duoRandom);  r.setInt("duoBgIdx", duoBgIdx);  r.setInt("duoFgIdx", duoFgIdx);
+  r.setBoolean("shadow", dropShadow);    r.setFloat("shadowStr", shadowStrength);
+  r.setFloat("shadowSize", shadowSize);  r.setFloat("shadowAngle", degrees(shadowAngle));
+  r.setBoolean("shadowGlobal", shadowGlobal);
+  r.setBoolean("line", lineMode);        r.setInt("lineCount", lineCount);
+  r.setFloat("lineDuty", lineDuty);      r.setFloat("lineSubdiv", lineSubdivProb);
+  r.setBoolean("kumiko", kumikoStyle);   r.setFloat("stripWidth", stripWidthFrac);
+  r.setBoolean("extrude", extrude3D);    r.setInt("extrudeMode", extrudeMode);
+  r.setFloat("vpX", vpX);                r.setFloat("vpY", vpY);
+  r.setFloat("extrudeDepth", extrudeDepth); r.setFloat("extrudeShade", extrudeShade);
+  r.setBoolean("imageMode", imageMode);
+  if (imagePath != null) r.setString("img", imagePath);
+  r.setInt("imgCols", imgCols);          r.setInt("imgLib", libSize);
+  r.setFloat("imgGamma", imgGamma);      r.setBoolean("imgStretch", imgStretch);
+  r.setBoolean("imgInvert", imgInvert);  r.setBoolean("imgContain", imgContain);
+  root.setJSONObject("render", r);
+
+  JSONObject pal = new JSONObject();                 // index + exact colour order (captures rotation)
+  pal.setInt("index", palettes.current);
+  Palette p = palettes.current();
+  JSONArray cols = new JSONArray();
+  for (int i = 0; i < p.size(); i++) cols.setInt(i, p.get(i));
+  pal.setJSONArray("colors", cols);
+  root.setJSONObject("palette", pal);
+
+  root.setJSONObject("catalog", currentCatalogJson());
+
+  JSONObject act = new JSONObject();                 // which tileset is active per (n,k)
+  for (String key : activeTilesetIdx.keySet()) act.setInt(key, activeTilesetIdx.get(key));
+  root.setJSONObject("activeTilesets", act);
+  return root;
+}
+
+// Sidecar path for a PNG (foo.png -> foo.json), and the writer.
+String manifestPathFor(String pngPath) {
+  int dot = pngPath.lastIndexOf('.');
+  return (dot > 0 ? pngPath.substring(0, dot) : pngPath) + ".json";
+}
+void saveManifest(String pngPath) {
+  String jp = manifestPathFor(pngPath);
+  saveJSONObject(renderManifest(), jp);
+  println("manifest " + jp);
+}
+
+// Inverse of renderManifest: restore every global, the palette colour order, and the
+// full tile catalog. Returns true on success. Called from setup() (TRUCHET_LOAD, as a
+// baseline the per-env overrides then refine) and the Controls "Load render…" button.
+boolean loadManifest(String path) {
+  JSONObject root = loadJSONObject(path);
+  if (root == null) { println("manifest not found / unreadable: " + path); return false; }
+  JSONObject r = root.getJSONObject("render");
+  if (r != null) {
+    shapeMode      = r.getInt("shape", shapeMode);
+    colorScheme    = r.getInt("scheme", colorScheme);
+    seedVal        = r.getInt("seed", seedVal);
+    gridN          = r.getInt("grid", gridN);
+    maxDepth       = r.getInt("depth", maxDepth);
+    subdivideProb  = r.getFloat("subdiv", subdivideProb);
+    symmetryMode   = r.getInt("sym", symmetryMode);
+    anchorsPerSide = r.getInt("anchors", anchorsPerSide);
+    winged         = r.getBoolean("winged", winged);
+    invertPerLevel = r.getBoolean("invert", invertPerLevel);
+    showGrid       = r.getBoolean("showGrid", showGrid);
+    duoRandom      = r.getBoolean("duoRandom", duoRandom);
+    duoBgIdx       = r.getInt("duoBgIdx", duoBgIdx);
+    duoFgIdx       = r.getInt("duoFgIdx", duoFgIdx);
+    dropShadow     = r.getBoolean("shadow", dropShadow);
+    shadowStrength = r.getFloat("shadowStr", shadowStrength);
+    shadowSize     = r.getFloat("shadowSize", shadowSize);
+    shadowAngle    = radians(r.getFloat("shadowAngle", degrees(shadowAngle)));
+    shadowGlobal   = r.getBoolean("shadowGlobal", shadowGlobal);
+    lineMode       = r.getBoolean("line", lineMode);
+    lineCount      = r.getInt("lineCount", lineCount);
+    lineDuty       = r.getFloat("lineDuty", lineDuty);
+    lineSubdivProb = r.getFloat("lineSubdiv", lineSubdivProb);
+    kumikoStyle    = r.getBoolean("kumiko", kumikoStyle);
+    stripWidthFrac = r.getFloat("stripWidth", stripWidthFrac);
+    extrude3D      = r.getBoolean("extrude", extrude3D);
+    extrudeMode    = r.getInt("extrudeMode", extrudeMode);
+    vpX            = r.getFloat("vpX", vpX);
+    vpY            = r.getFloat("vpY", vpY);
+    extrudeDepth   = r.getFloat("extrudeDepth", extrudeDepth);
+    extrudeShade   = r.getFloat("extrudeShade", extrudeShade);
+    imageMode      = r.getBoolean("imageMode", imageMode);
+    if (r.hasKey("img")) imagePath = r.getString("img");
+    imgCols        = r.getInt("imgCols", imgCols);
+    libSize        = r.getInt("imgLib", libSize);
+    imgGamma       = r.getFloat("imgGamma", imgGamma);
+    imgStretch     = r.getBoolean("imgStretch", imgStretch);
+    imgInvert      = r.getBoolean("imgInvert", imgInvert);
+    imgContain     = r.getBoolean("imgContain", imgContain);
+  }
+  if (root.hasKey("palette")) {
+    JSONObject pal = root.getJSONObject("palette");
+    palettes.setCurrent(pal.getInt("index", palettes.current));
+    if (pal.hasKey("colors")) {
+      JSONArray cols = pal.getJSONArray("colors");
+      Palette p = palettes.current();
+      if (cols.size() == p.size())
+        for (int i = 0; i < cols.size(); i++) p.colors[i] = cols.getInt(i);
+    }
+  }
+  if (root.hasKey("catalog")) applyCatalog(root.getJSONObject("catalog"));
+  if (root.hasKey("activeTilesets")) {               // restore which tileset is active per (n,k)
+    JSONObject act = root.getJSONObject("activeTilesets");
+    for (Object ko : act.keys()) activeTilesetIdx.put((String) ko, act.getInt((String) ko));
+  }
+  manifestLoaded = true;
+  return true;
+}
+
+// Controls "Load render…" callback: restore a full manifest and re-render.
+void manifestChosen(File selection) {
+  if (selection == null) return;                     // user cancelled
+  logAction("LOAD render " + selection.getAbsolutePath());  // prime race suspect: reassigns the catalog
+  if (!loadManifest(selection.getAbsolutePath())) return;
+  sourceImg = null;                                  // force reload if the manifest is image mode
+  dirtyLayout = true; dirtyGradient = true; imgDirty = true;
+  controlsNeedSync = true;                            // refresh the Controls widgets next frame
+  redraw();
+}
+
+// ---- debug logging helpers --------------------------------------
+// dbg: emit one categorized, thread-tagged, timestamped line to the console and the
+// persistent log file. Early-returns when debug is off so call sites cost ~nothing.
+void dbg(String cat, String msg) {
+  if (!debugLog) return;
+  String line = String.format("[+%.1fs][%s] %s: %s",
+    (millis() - debugStartMs) / 1000.0, Thread.currentThread().getName(), cat, msg);
+  println(line);
+  writeDebugLine(line);
+}
+
+// logAction: record a user action so a later crash dump can quote the last one.
+void logAction(String msg) {
+  lastAction = msg;
+  dbg("ACTION", msg);
+}
+
+// phase: set the render-phase breadcrumb (always; cheap, read by dbgCrash). Emits a
+// PHASE log line only when animation is OFF -- under continuous playback the per-frame
+// phases would flood the log, but a crash still reports the breadcrumb either way.
+void phase(String p) {
+  renderPhase = p;
+  if (debugLog && !animEnabled) dbg("PHASE", p);
+}
+
+// writeDebugLine: append to the log file (opening it on first use). Guarded so logging
+// can never itself throw and mask the bug we're chasing.
+void writeDebugLine(String line) {
+  try {
+    if (debugFile == null) openDebugFile();
+    if (debugFile != null) { debugFile.println(line); debugFile.flush(); }
+  } catch (Throwable t) { /* never let logging crash the sketch */ }
+}
+
+void openDebugFile() {
+  try {
+    java.io.File dir = new java.io.File(sketchPath("logs"));
+    if (!dir.exists()) dir.mkdirs();
+    // millis()-based name (wall-clock formatting is avoided here); append mode keeps
+    // one file across repeated 'd' toggles within a session.
+    java.io.File f = new java.io.File(dir, "debug-" + (System.currentTimeMillis()) + ".log");
+    debugFile = new java.io.PrintWriter(new java.io.FileWriter(f, true), true);
+  } catch (Throwable t) {
+    println("debug: could not open log file: " + t);
+    debugFile = null;
+  }
+}
+
+// enableDebug: flip the gate and announce the transition (forced through, so the line
+// appears even when turning logging off).
+void enableDebug(boolean on) {
+  boolean was = debugLog;
+  debugLog = true;                 // force the announcement line to be emitted...
+  dbg("DEBUG", (on ? "ON" : "OFF") + " (was " + was + ")");
+  debugLog = on;                   // ...then settle to the requested state
+}
+
+// dbgCrash: the whole point. On any exception in a draw loop, dump the offending
+// thread, the last user action, the render phase reached, a compact state line, and
+// the full stack trace -- to both console and the log file -- then stop the loop so a
+// recurring crash doesn't flood. A crash is always recorded, even if 'd' was never on.
+void dbgCrash(Throwable e) {
+  boolean was = debugLog;
+  debugLog = true;
+  String state = "scheme=" + schemeName(colorScheme) + " shape=" + SHAPE_NAMES[shapeMode]
+    + " k=" + anchorsPerSide + " sym=" + SYMMETRY_NAMES[symmetryMode]
+    + " image=" + imageMode + " line=" + lineMode + " extrude=" + extrude3D + " seed=" + seedVal;
+  dbg("CRASH", "!!! " + e.getClass().getName() + (e.getMessage() != null ? ": " + e.getMessage() : ""));
+  dbg("CRASH", "thread=" + Thread.currentThread().getName() + "  lastAction=" + lastAction);
+  dbg("CRASH", "phase=" + renderPhase + "  " + state);
+  e.printStackTrace();                                    // console
+  try {                                                   // and the log file
+    if (debugFile == null) openDebugFile();
+    if (debugFile != null) { e.printStackTrace(debugFile); debugFile.flush(); }
+  } catch (Throwable t) { /* ignore */ }
+  debugLog = was;
+  noLoop();   // halt the loop; the static frame + log are preserved for inspection
+}
+
 // ---- interaction ------------------------------------------------
 void keyPressed() {
+  logAction("KEY '" + (key == ' ' ? "SPACE" : key) + "'");
   if (key == ' ') {
     seedVal = int(random(1, 99999));
     dirtyLayout = true; dirtyGradient = true;
@@ -1129,6 +1863,12 @@ void keyPressed() {
     lineMode = !lineMode;
     println("line mode: " + lineMode);
     redraw();
+  } else if (key == 'k' || key == 'K') {   // toggle Kumiko thin-strip lattice style
+    kumikoStyle = !kumikoStyle;
+    println("kumiko style: " + kumikoStyle);
+    redraw();
+  } else if (key == 'd' || key == 'D') {   // toggle debug action/crash logging
+    enableDebug(!debugLog);
   }
 }
 

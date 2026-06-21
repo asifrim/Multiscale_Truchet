@@ -36,6 +36,7 @@ import java.awt.geom.AffineTransform;
 import java.awt.AlphaComposite;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.io.File;                              // tiles.json existence check (see loadTileCatalog)
 
 int shapeMode = 0;                         // 0 = square, 1 = triangle, 2 = hexagon, 3 = trapezoid
 String[] SHAPE_NAMES = { "square", "triangle", "hexagon", "trapezoid" };
@@ -157,8 +158,18 @@ int[][][] HEX_CONNS = {
 };
 float[] HEX_W = { 2.5, 2.0, 2.0, 1.5, 1.0 };
 
-int[][][] connsFor(int n)   { return n == 3 ? TRI_CONNS : (n == 6 ? HEX_CONNS : TILE_CONNS); }
-float[]   weightsFor(int n) { return n == 3 ? TRI_W     : (n == 6 ? HEX_W     : TILE_W); }
+// Alphabet for shape n at the current global anchorsPerSide (k): the 16 conns /
+// weights of the ACTIVE tileset for (n, k), or a single blank motif if that (n, k)
+// has no tileset yet. The Tiles panel writes weights into the returned array by
+// reference, so edits land in the live tileset.
+int[][][] connsFor(int n) {
+  Tileset ts = activeTilesetFor(n);
+  return ts != null ? ts.conns : BLANK_CONNS;
+}
+float[] weightsFor(int n) {
+  Tileset ts = activeTilesetFor(n);
+  return ts != null ? ts.weights : BLANK_W;
+}
 
 // ---- building the top-level tiling -----------------------------
 ArrayList<Tile> buildRoots() {
@@ -349,6 +360,17 @@ class TileGeom {
   float[] bgWx, bgWy, fgWx, fgWy;  // wing-disc centres (bg corners / fg ports)
   boolean wings;
   float side;
+  // multi-anchor (anchorsPerSide = k): k ports per side at (s+0.5)/k along the edge.
+  // k = 1 reproduces the classic single-midpoint tile EXACTLY (same code path).
+  // Band width / wing radii scale by 1/k (side/(3k), side/(6k)) so a k-anchor edge
+  // crosses at the central third of each 1/k sub-segment -- the multi-scale seam
+  // generalises (a coarse edge's crossings stay a subset of its children's).
+  int   anchors = 1;
+  float bandW;                     // band stroke width  = side/(3k)
+  float fgR0;                      // fg nub radius       = side/(6k)
+  float bgR0;                      // bg corner radius    = side/(3k)
+  boolean wholeHex;                // a single-anchor hexagon: the wing-less batched coarse layer
+  float cxC, cyC;                  // polygon centre (interior anchor port)
   // trapezoid effective placement (p0,e with animRotOffset folded in about the centroid)
   float tpx, tpy, tex, tey;
 
@@ -357,7 +379,10 @@ class TileGeom {
     n = t.n;
     if (trap) { initTrap(t); return; }
 
-    conns = connsFor(n)[t.mi];
+    anchors = max(1, anchorsPerSide);
+    int[][][] alpha = connsFor(n);
+    if (alpha == null) { dbg("NULL", "connsFor(" + n + ") null at k=" + anchorsPerSide + " mi=" + t.mi); alpha = BLANK_CONNS; }
+    conns = (t.mi >= 0 && t.mi < alpha.length) ? alpha[t.mi] : new int[0][];   // mi = -1 -> blank tile
     // flip = mirror twin: wind the vertices the other way (and negate the motif
     // rotation), which renders the exact mirror image of the source's motif --
     // edge k of the flipped tile is the reflection of edge k of the source, so
@@ -379,10 +404,41 @@ class TileGeom {
       mx[k] = (vx[k] + vx[k2]) / 2;
       my[k] = (vy[k] + vy[k2]) / 2;
     }
+    cxC = 0; cyC = 0;
+    for (int k = 0; k < n; k++) { cxC += vx[k]; cyC += vy[k]; }
+    cxC /= n; cyC /= n;          // polygon centre (an interior anchor port)
     side = dist(vx[0], vy[0], vx[1], vy[1]);
-    wings = winged && n != 6;
-    bgWx = vx; bgWy = vy;        // bg discs at the vertices
-    fgWx = mx; fgWy = my;        // fg nubs at the edge midpoints
+    // a whole hexagon (the batched, wing-less coarse layer) only exists at k = 1;
+    // multi-anchor hexagons are treated like any winged polygon (clip + wings).
+    wholeHex = (n == 6 && anchors == 1);
+    wings = winged && !wholeHex && !kumikoStyle;   // Kumiko = bare strips, no wing discs
+    bandW = side / (3.0 * anchors);
+    fgR0  = side / (6.0 * anchors);
+    bgR0  = side / (3.0 * anchors);
+    if (anchors == 1) {
+      bgWx = vx; bgWy = vy;        // bg discs at the vertices (corners)
+      fgWx = mx; fgWy = my;        // fg nubs at the edge midpoints
+    } else {
+      fgWx = new float[n * anchors]; fgWy = new float[n * anchors];
+      // bg discs at the k sub-segment BOUNDARIES per edge (i/k for i = 0..k-1):
+      // i = 0 is the corner (vertex e); i = 1..k-1 are the points BETWEEN adjacent
+      // anchors. With radius side/(3k) they fill the edge gaps between bands, so
+      // each 1/k sub-segment reads as a k=1 edge (bg-disc / band / bg-disc) and the
+      // discs coincide across a shared edge exactly like the corner discs.
+      bgWx = new float[n * anchors]; bgWy = new float[n * anchors];
+      for (int e = 0; e < n; e++) {
+        int e2 = (e + 1) % n;
+        for (int s = 0; s < anchors; s++) {
+          int p = e * anchors + s;
+          float ta = (s + 0.5) / anchors;       // anchor (fg nub) at (s+0.5)/k
+          fgWx[p] = vx[e] + ta * (vx[e2] - vx[e]);
+          fgWy[p] = vy[e] + ta * (vy[e2] - vy[e]);
+          float tb = (float) s / anchors;       // boundary (bg disc) at s/k
+          bgWx[p] = vx[e] + tb * (vx[e2] - vx[e]);
+          bgWy[p] = vy[e] + tb * (vy[e2] - vy[e]);
+        }
+      }
+    }
   }
 
   // Trapezoid: fold animRotOffset (a spin about the canonical centroid Cc) into
@@ -390,7 +446,8 @@ class TileGeom {
   // Rotating z about Cc by theta and applying p0 + z*e is the same as a new
   // similarity (p0', e') with e' = e*e^{i*theta} and p0' = p0 + Cc*e - Cc*e'.
   void initTrap(Tile t) {
-    conns = TRAP_CONNS[t.mi];
+    conns = (t.mi >= 0 && t.mi < TRAP_CONNS.length) ? TRAP_CONNS[t.mi] : new int[0][];   // mi = -1 -> blank
+    anchors = 1; wholeHex = false;       // trapezoid keeps its bespoke 5-port geometry
     float th = animRotOffset;                 // 0 when animation is off -> identity
     float c = cos(th), s = sin(th);
     float epx = t.ex * c - t.ey * s, epy = t.ex * s + t.ey * c;   // e' = e*e^{i th}
@@ -400,6 +457,7 @@ class TileGeom {
     tpy = t.p0y + (Ccx * t.ey + Ccy * t.ex) - (Ccx * epy + Ccy * epx);
     tex = epx; tey = epy;
     side = sqrt(t.ex * t.ex + t.ey * t.ey) * trapPPU;
+    bandW = side / 3.0; fgR0 = side / 6.0; bgR0 = side / 3.0;
 
     vx = new float[TRAP_V.length];    vy = new float[TRAP_V.length];
     for (int k = 0; k < TRAP_V.length; k++)    { vx[k] = tsx(TRAP_V[k][0], TRAP_V[k][1]);    vy[k] = tsy(TRAP_V[k][0], TRAP_V[k][1]); }
@@ -407,7 +465,7 @@ class TileGeom {
     for (int k = 0; k < TRAP_CORN.length; k++) { bgWx[k] = tsx(TRAP_CORN[k][0], TRAP_CORN[k][1]); bgWy[k] = tsy(TRAP_CORN[k][0], TRAP_CORN[k][1]); }
     fgWx = new float[TRAP_PORT.length]; fgWy = new float[TRAP_PORT.length];
     for (int k = 0; k < TRAP_PORT.length; k++) { fgWx[k] = tsx(TRAP_PORT[k][0], TRAP_PORT[k][1]); fgWy[k] = tsy(TRAP_PORT[k][0], TRAP_PORT[k][1]); }
-    wings = winged;                   // 5 ports is odd -> always need nub caps
+    wings = winged && !kumikoStyle;   // 5 ports is odd -> always need nub caps (unless Kumiko)
   }
 
   // canonical (zx,zy) -> screen, using the effective placement (incl. anim spin).
@@ -421,6 +479,19 @@ class TileGeom {
   // arc specs (appendTrapConn). Stroked at width side/3 by the caller.
   void appendBands(Path2D.Float path) { appendBandsOffset(path, 0); }
 
+  // Circuit motifs (inline components + point glyphs) are fine linework, so they
+  // are stroked at a THIN weight proportional to their feature size -- not the full
+  // band width (side/3), which would blob their detail together. They render in a
+  // separate path; appendBandsSplit routes them apart from the regular bands.
+  boolean thinMotif(int code) { return isInlineComp(code) || isPointGlyph(code); }
+  boolean hasThinMotif() { for (int[] cn : conns) if (thinMotif(cn[0])) return true; return false; }
+  float motifStrokeW()   { return max(0.75, side / (10.0 * anchors) * animBandScale); }
+  // Split append (offset 0): regular bands -> `bands`, thin circuit motifs -> `thin`.
+  void appendBandsSplit(Path2D.Float bands, Path2D.Float thin) {
+    if (trap) { appendBands(bands); return; }            // trapezoid has no circuit motifs
+    for (int[] cn : conns) appendMotifConn(thinMotif(cn[0]) ? thin : bands, cn, 0);
+  }
+
   // Append every connection's centre-line, displaced by a constant PERPENDICULAR
   // `offset` (px) -- offset 0 is the centre-line (the solid-band path); line mode
   // calls this once per line in the bundle (see lineOffsets / drawTileBands).
@@ -428,7 +499,7 @@ class TileGeom {
     if (trap) {
       for (int[] cn : conns) appendTrapConn(path, cn[0], cn[1], offset);
     } else {
-      for (int[] cn : conns) appendConn(path, cn[0], cn[1], n, vx, vy, mx, my, offset);
+      for (int[] cn : conns) appendMotifConn(path, cn, offset);
     }
   }
 
@@ -438,7 +509,144 @@ class TileGeom {
   void appendOneBand(Path2D.Float path, int ci, float offset) {
     int[] cn = conns[ci];
     if (trap) appendTrapConn(path, cn[0], cn[1], offset);
-    else      appendConn(path, cn[0], cn[1], n, vx, vy, mx, my, offset);
+    else      appendMotifConn(path, cn, offset);
+  }
+
+  // Dispatch one (non-trapezoid) connection: a tagged primitive (hub/hump, see
+  // TILE_CONNS) or a plain edge pair {i,j}.
+  void appendMotifConn(Path2D.Float path, int[] cn, float offset) {
+    if (cn[0] == CONN_HUB)  { appendHub(path, cn, n, vx, vy, mx, my, offset); return; }   // k=1 only
+    if (cn[0] == CONN_HUMP) { appendHump(path, cn[1], cn[2], mx, my, offset); return; }   // k=1 only
+    if (cn[0] == CONN_CIRCLE) {                                                            // a ring at a port
+      float[] c = portXY(cn[1]);
+      appendCircle(path, c[0], c[1], side / (3.0 * anchors), offset);
+      return;
+    }
+    if (cn[0] == CONN_DOT) return;     // a solid disc -- a filled element, drawn by the fill passes, not stroked
+    if (isInlineComp(cn[0])) {         // resistor / inductor / capacitor / stepped between two ports
+      float[] A = portXY(cn[1]), B = portXY(cn[2]);
+      appendComponent(path, cn[0], A[0], A[1], B[0], B[1], side / (3.5 * anchors), offset);
+      return;
+    }
+    if (cn[0] == CONN_TERM) {          // small open ring (concentric in line mode, like CONN_CIRCLE)
+      float[] c = portXY(cn[1]);
+      appendCircle(path, c[0], c[1], side / (6.0 * anchors), offset);
+      return;
+    }
+    if (cn[0] == CONN_GROUND || cn[0] == CONN_ARROW || cn[0] == CONN_CROSS) {
+      appendGlyph(path, cn[0], cn[1]);  // stroked glyph; ignores offset (drawn once at the centre-line)
+      return;
+    }
+    int pa = cn[0], pb = cn[1];
+    // a connection is a straight line when explicitly flagged ([a,b,1]) or when it
+    // touches an interior port (centre / apothem midpoint -- no edge line to arc on).
+    boolean straight = (cn.length >= 3 && cn[2] == 1) || isInteriorPort(pa) || isInteriorPort(pb);
+    if (anchors > 1 || straight) appendPortConn(path, pa, pb, straight, offset);
+    else                         appendConn(path, pa, pb, n, vx, vy, mx, my, offset);     // k=1 edge pair (unchanged)
+  }
+
+  // Ports: n*k edge anchors, then n apothem midpoints, the centre, then n vertices
+  // (corners). isInteriorPort is true for everything past the edge anchors: they
+  // share "no single edge line", so their connections are drawn straight -- a vertex
+  // (like an apothem midpoint / the centre) has no one edge to arc on. Vertex ports
+  // are the Kumiko lattice points (strips run corner -> edge midpoint -> centroid).
+  boolean isInteriorPort(int p) { return p >= n * anchors; }
+  // Centres of any solid-point (CONN_DOT) motifs -- filled discs (radius side/(6k))
+  // drawn by the fill passes (foreground / shadow / extrude), like wing nubs.
+  ArrayList<float[]> dotXY() {
+    ArrayList<float[]> out = new ArrayList<float[]>();
+    if (trap) return out;
+    for (int[] cn : conns) if (cn[0] == CONN_DOT) out.add(portXY(cn[1]));
+    return out;
+  }
+  // Screen position of port p: edge anchors (fgWx), then apothem midpoints (centre
+  // -> edge midpoint, halfway), then the centre, then the n vertices (corners).
+  // (k=1: fgWx == edge midpoints.)
+  float[] portXY(int p) {
+    int E = n * anchors;
+    if (p < E)      return new float[]{ fgWx[p], fgWy[p] };
+    if (p < E + n)  { int e = p - E; return new float[]{ (cxC + mx[e]) / 2, (cyC + my[e]) / 2 }; }
+    if (p == E + n) return new float[]{ cxC, cyC };
+    int v = p - (E + n + 1); return new float[]{ vx[v], vy[v] };   // vertex (corner) port
+  }
+
+  // Multi-anchor connection between two ports (port p = edge*k + slot, anchor at
+  // (slot+0.5)/k along edge p/k). When both anchors are equidistant from the two
+  // edge lines' intersection (all symmetric pairs, incl. every k=1 case) the band
+  // is a perpendicular CIRCULAR ARC -- the classic Truchet curve. Otherwise (free
+  // pairing of asymmetric anchors, or parallel edges) it is a cubic BEZIER whose
+  // end tangents run along the inward edge normals, so it still crosses each edge
+  // perpendicular at the anchor (the seamless-connection condition). Sampled into a
+  // polyline like appendConn, so every downstream pass (stroke/shadow/extrude) works.
+  void appendPortConn(Path2D.Float path, int pa, int pb, boolean straight, float offset) {
+    float[] A = portXY(pa), B = portXY(pb);
+    float pax = A[0], pay = A[1], pbx = B[0], pby = B[1];
+    if (straight) { appendStraight(path, pax, pay, pbx, pby, offset); return; }
+    int k = anchors;                                  // here both ports are edge anchors
+    int ea = pa / k, eb = pb / k, ea2 = (ea + 1) % n, eb2 = (eb + 1) % n;
+    // Scale-invariant parallel test: |sin(angle between edges)|. Decides arc vs
+    // bezier from the edge directions, NOT from lineIntersect's tiny-denominator
+    // cutoff -- otherwise a near-parallel pair (e.g. opposite edges) flips between
+    // bezier and a huge-radius arc under floating-point noise, which broke the
+    // mirror match between a tile and its flipped twin.
+    float[] C = nearlyParallel(vx[ea], vy[ea], vx[ea2], vy[ea2], vx[eb], vy[eb], vx[eb2], vy[eb2])
+                ? null
+                : lineIntersect(vx[ea], vy[ea], vx[ea2], vy[ea2], vx[eb], vy[eb], vx[eb2], vy[eb2]);
+    if (C != null) {
+      float ra = dist(pax, pay, C[0], C[1]), rb = dist(pbx, pby, C[0], C[1]);
+      if (ra > 0.1 && abs(ra - rb) <= 1e-3 * max(ra, rb)) {     // equal radii -> arc
+        float r = ra * animArcRadius + offset;
+        if (r < 0.1) r = 0.1;
+        float a0 = atan2(pay - C[1], pax - C[0]);
+        float a1 = atan2(pby - C[1], pbx - C[0]);
+        float diff = a1 - a0;
+        while (diff <= -PI) diff += TWO_PI;
+        while (diff > PI)  diff -= TWO_PI;
+        diff *= animArcSweep;
+        int seg = max(8, ceil(r * abs(diff) / 3.0));
+        for (int q = 0; q <= seg; q++) {
+          float ph = a0 + diff * q / seg;
+          float px = C[0] + r * cos(ph), py = C[1] + r * sin(ph);
+          if (q == 0) path.moveTo(px, py); else path.lineTo(px, py);
+        }
+        return;
+      }
+    }
+    // cubic bezier with tangents along the inward edge normals
+    float cxC = 0, cyC = 0;
+    for (int q = 0; q < n; q++) { cxC += vx[q]; cyC += vy[q]; }
+    cxC /= n; cyC /= n;
+    float[] na = inwardNormal(vx[ea], vy[ea], vx[ea2], vy[ea2], pax, pay, cxC, cyC);
+    float[] nb = inwardNormal(vx[eb], vy[eb], vx[eb2], vy[eb2], pbx, pby, cxC, cyC);
+    float h = 0.42 * dist(pax, pay, pbx, pby);
+    float c1x = pax + na[0] * h, c1y = pay + na[1] * h;
+    float c2x = pbx + nb[0] * h, c2y = pby + nb[1] * h;
+    int seg = max(10, ceil(dist(pax, pay, pbx, pby) / 3.0));
+    for (int q = 0; q <= seg; q++) {
+      float u = (float) q / seg;
+      float bx = bez(pax, c1x, c2x, pbx, u), by = bez(pay, c1y, c2y, pby, u);
+      if (offset != 0) {                                   // parallel-curve offset (line mode)
+        float tx = bezD(pax, c1x, c2x, pbx, u), ty = bezD(pay, c1y, c2y, pby, u);
+        float tl = max(1e-4, sqrt(tx * tx + ty * ty));
+        bx += -ty / tl * offset; by += tx / tl * offset;
+      }
+      if (q == 0) path.moveTo(bx, by); else path.lineTo(bx, by);
+    }
+  }
+
+  // A point glyph (ground / arrow / cross) stroked at a port, oriented INWARD
+  // (port -> tile centre; defaults to screen-up at the centre port). Built in a
+  // local frame (u = inward unit, w = perpendicular) and appended as stroked
+  // subpaths, so it flows through every pass like a band. Offset is ignored (a
+  // glyph is a fixed mark, not a parallel bundle).
+  void appendGlyph(Path2D.Float path, int code, int port) {
+    float[] P = portXY(port);
+    float ux = cxC - P[0], uy = cyC - P[1];
+    float L = sqrt(ux * ux + uy * uy);
+    if (L < 1e-3) { ux = 0; uy = -1; } else { ux /= L; uy /= L; }   // inward unit
+    float wx = -uy, wy = ux;                                        // perpendicular
+    float g = side / (6.0 * anchors);                              // base unit (nub radius)
+    emitGlyph(path, code, P[0], P[1], ux, uy, wx, wy, g);
   }
 
   // One trapezoid connection: a circular arc (in canonical coords) sampled into a
@@ -472,7 +680,7 @@ void drawTileBackground(Tile t, color bg) {
   //  (b) whole hexagons (n==6): a hexagon only ever exists at depth 0, so its bg
   //      always equals the canvas colour -- drawing the opaque polygon lets a
   //      later tile slice a 1px AA seam between overlapping bands at shared edges.
-  if (colorScheme != 3 && gm.n != 6) {
+  if (colorScheme != 3 && !gm.wholeHex) {
     noStroke();
     fill(bg);
     beginShape();
@@ -489,8 +697,8 @@ void drawTileBackground(Tile t, color bg) {
     // it on RADIUS makes later arc() calls (here and in the next frame) read
     // their diameter args as radii -- doubling the arcs into a chunky mess.
     noStroke();
-    fill(bg);                                          // corner discs, r = side/3 (* anim)
-    float bgD = 2 * gm.side / 3.0 * animDiscScale;
+    fill(bg);                                          // corner discs, r = side/(3k) (* anim)
+    float bgD = 2 * gm.bgR0 * animDiscScale;
     for (int k = 0; k < gm.bgWx.length; k++)
       ellipse(gm.bgWx[k], gm.bgWy[k], bgD, bgD);
   }
@@ -505,12 +713,12 @@ void drawTileBackground(Tile t, color bg) {
 // slightly across shared edges.
 void drawTileForeground(Tile t, color fg) {
   TileGeom gm = new TileGeom(t);
-  if (gm.n == 6 && colorScheme != 2) {
+  if (gm.wholeHex && colorScheme != 2) {
     // whole hexagons (uniform colour): defer the bands into the shared batch
     // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
     // is per-tile coloured, so it can't batch and falls through to per-tile.
     if (lineMode)
-      for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendBandsOffset(hexBatch, off);
+      for (float off : lineOffsets(lineBundleW(gm))) gm.appendBandsOffset(hexBatch, off);
     else
       gm.appendBands(hexBatch);
     hexBatchUsed = true;
@@ -520,14 +728,16 @@ void drawTileForeground(Tile t, color fg) {
     // Line mode skips the polygon clip: the thin lines stay within the band
     // region anyway, and clipping at the tile edge would slice the round caps
     // back to flat. (Solid bands keep the clip as a safety net for wide arcs.)
-    boolean doClip = (gm.n != 6) && !lineMode;
+    // Kumiko skips the clip too, so thin strips spill across tile edges and meet
+    // their neighbours at the shared lattice points (vertices / edge midpoints).
+    boolean doClip = !gm.wholeHex && !lineMode && !kumikoStyle;
     java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
     drawTileBands(gm, fg);
     if (doClip) popPolyClip(oldClip);
   }
 
   if (gm.wings) {
-    float fgR = gm.side / 6.0 * animDiscScale;          // fg nub radius
+    float fgR = gm.fgR0 * animDiscScale;                // fg nub radius
     if (lineMode) {
       // concentric rings at the connection points -> the little target/spiral
       // circles of the parallel-line style. The radii are the SAME offset grid
@@ -551,10 +761,22 @@ void drawTileForeground(Tile t, color fg) {
         for (int k = 0; k < gm.fgWx.length; k++) fillDiscG2(gm.fgWx[k], gm.fgWy[k], fgR);
       } else {
         fill(fg);
-        float fgD = gm.side / 3.0 * animDiscScale;       // diameter (radius side/6 * anim)
+        float fgD = 2 * gm.fgR0 * animDiscScale;          // diameter (radius side/(6k) * anim)
         for (int k = 0; k < gm.fgWx.length; k++)
           ellipse(gm.fgWx[k], gm.fgWy[k], fgD, fgD);
       }
+    }
+  }
+
+  // solid points (CONN_DOT): filled discs of band width at any port, always solid
+  // (even in line mode), regardless of wings -- so they work at interior ports too.
+  ArrayList<float[]> dots = gm.dotXY();
+  if (!dots.isEmpty()) {
+    noStroke();
+    float r = gm.fgR0 * animDiscScale, dd = 2 * r;
+    for (float[] p : dots) {
+      if (gradientStroke()) fillDiscG2(p[0], p[1], r);
+      else { fill(fg); ellipse(p[0], p[1], dd, dd); }
     }
   }
 }
@@ -576,7 +798,7 @@ void drawTileForeground(Tile t, color fg) {
 void drawTileLineRings(Tile t, color fg) {
   TileGeom gm = new TileGeom(t);
   if (!gm.wings) return;
-  float fgR = gm.side / 6.0 * animDiscScale;
+  float fgR = gm.fgR0 * animDiscScale;
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
   g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_BUTT, BasicStroke.JOIN_ROUND));
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
@@ -621,15 +843,15 @@ boolean[] solidPorts(TileGeom gm, Tile t) {
 void drawTileRibbonBase(Tile t, color bg) {
   TileGeom gm = new TileGeom(t);
   if (!gm.hasBands()) return;
-  if (gm.n == 6 && colorScheme != 2) return;
+  if (gm.wholeHex && colorScheme != 2) return;
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  boolean doClip = (gm.n != 6);
+  boolean doClip = !gm.wholeHex;
   java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
   Path2D.Float path = new Path2D.Float();
   gm.appendBands(path);
-  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
   g2.setPaint(awtColor(bg));
-  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
+  g2.setStroke(new BasicStroke(gm.bandW * animBandScale, cap, BasicStroke.JOIN_ROUND));
   g2.draw(path);
   if (doClip) popPolyClip(oldClip);
 }
@@ -643,10 +865,10 @@ void drawTileRibbonBase(Tile t, color bg) {
 // into the shared batch paths exactly as drawTileForeground does.
 void drawTileLineBundle(Tile t, color fg) {
   TileGeom gm = new TileGeom(t);
-  if (gm.n == 6 && colorScheme != 2) {
+  if (gm.wholeHex && colorScheme != 2) {
     for (int ci = 0; ci < gm.conns.length; ci++)
       if (strokeSubdivided(t, ci))
-        for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendOneBand(hexBatch, ci, off);
+        for (float off : lineOffsets(lineBundleW(gm))) gm.appendOneBand(hexBatch, ci, off);
       else
         gm.appendOneBand(hexSolidBatch, ci, 0);
     hexBatchUsed = true;
@@ -660,16 +882,19 @@ void drawTileLineBundle(Tile t, color fg) {
   Path2D.Float solid = new Path2D.Float();   // full-thickness strokes
   for (int ci = 0; ci < gm.conns.length; ci++) {
     if (strokeSubdivided(t, ci))
-      for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendOneBand(lines, ci, off);
+      for (float off : lineOffsets(lineBundleW(gm))) gm.appendOneBand(lines, ci, off);
     else
       gm.appendOneBand(solid, ci, 0);
   }
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
-  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
+  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setStroke(bandStroke(gm.bandW, gm.side, cap));
   g2.draw(solid);
   g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
   g2.draw(lines);
+  // solid points: filled discs on top (paint already fg)
+  float dr = gm.fgR0 * animDiscScale;
+  for (float[] p : gm.dotXY()) g2.fill(new Ellipse2D.Float(p[0] - dr, p[1] - dr, 2 * dr, 2 * dr));
 }
 
 // Stable per-stroke (tile + connection) coin flip: true => subdivide into the
@@ -718,21 +943,26 @@ Graphics2D beginShadowLayer() {
 
 void addTileShadow(Graphics2D sg, Tile t) {
   TileGeom gm = new TileGeom(t);
-  float off = shadowSize * gm.side / 3.0;
+  float off = shadowSize * gm.bandW;
   AffineTransform oldT = sg.getTransform();
   sg.translate(off * cos(shadowAngle), off * sin(shadowAngle));
   if (gm.hasBands()) {
-    Path2D.Float path = new Path2D.Float();
-    gm.appendBands(path);
-    int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-    sg.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
-    sg.draw(path);
+    int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+    Path2D.Float bands = new Path2D.Float(), thin = new Path2D.Float();
+    gm.appendBandsSplit(bands, thin);
+    sg.setStroke(new BasicStroke(gm.bandW * animBandScale, cap, BasicStroke.JOIN_ROUND));
+    sg.draw(bands);
+    if (gm.hasThinMotif()) {                   // circuit motifs cast a thin shadow, not a band-wide one
+      sg.setStroke(new BasicStroke(gm.motifStrokeW(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+      sg.draw(thin);
+    }
   }
-  if (gm.wings) {                             // the fg nubs cast shadows too
-    float r = gm.side / 6.0 * animDiscScale;
+  float r = gm.fgR0 * animDiscScale;
+  if (gm.wings)                               // the fg nubs cast shadows too
     for (int k = 0; k < gm.fgWx.length; k++)
       sg.fill(new Ellipse2D.Float(gm.fgWx[k] - r, gm.fgWy[k] - r, 2 * r, 2 * r));
-  }
+  for (float[] p : gm.dotXY())                // solid points cast shadows too
+    sg.fill(new Ellipse2D.Float(p[0] - r, p[1] - r, 2 * r, 2 * r));
   sg.setTransform(oldT);
 }
 
@@ -769,25 +999,29 @@ void drawExtrudeLevel(int d) {
   // collect this level's silhouette: all band subpaths + wing-nub discs. Within a
   // level every tile is the same size, so one representative side/n/cap applies.
   Path2D.Float bands = new Path2D.Float();
+  Path2D.Float thin  = new Path2D.Float();              // circuit motifs (thin walls)
   ArrayList<float[]> nubs = new ArrayList<float[]>();   // {cx, cy, r}
-  float repSide = 0; int repN = 4; boolean any = false;
+  float repSide = 0, repBandW = 0; boolean repWholeHex = false; boolean any = false, anyThin = false;
   for (Tile lf : leaves) {
     if (lf.depth != d) continue;
     TileGeom gm = new TileGeom(lf);
-    gm.appendBands(bands);
-    if (gm.wings) {                             // hex tiles have no nubs
-      float r = gm.side / 6.0 * animDiscScale;
+    gm.appendBandsSplit(bands, thin);
+    if (gm.hasThinMotif()) anyThin = true;
+    float r = gm.fgR0 * animDiscScale;
+    if (gm.wings)                               // whole-hex tiles have no nubs
       for (int k = 0; k < gm.fgWx.length; k++) nubs.add(new float[]{ gm.fgWx[k], gm.fgWy[k], r });
-    }
-    repSide = gm.side; repN = gm.n; any = true;
+    for (float[] p : gm.dotXY()) nubs.add(new float[]{ p[0], p[1], r });   // solid points extrude too
+    repSide = gm.side; repBandW = gm.bandW; repWholeHex = gm.wholeHex; any = true;
   }
   if (!any) return;
   float depthPx = extrudeDepth * repSide;       // depth scales with tile size
   if (depthPx < 0.5) return;
-  int cap = (repN == 6) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  int cap = repWholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
 
+  float bandW  = repBandW * animBandScale;
+  float motifW = anyThin ? max(0.75, repSide / (10.0 * anchorsPerSide) * animBandScale) : 0;
+  Path2D.Float thinArg = anyThin ? thin : null;
   Graphics2D sg = beginExtrudeLayer();          // cleared, AA on, paint = side colour
-  sg.setStroke(new BasicStroke(repSide / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
   AffineTransform base = sg.getTransform();     // identity
 
   if (extrudeMode == 0) {                        // OBLIQUE: parallel translate toward the VP
@@ -799,7 +1033,7 @@ void drawExtrudeLevel(int d) {
       float t = depthPx * s / n;
       sg.setTransform(base);
       sg.translate(dx * t, dy * t);
-      stampExtrudeBody(sg, bands, nubs);
+      stampExtrudeBody(sg, bands, nubs, thinArg, bandW, motifW, cap);
     }
   } else {                                       // 1-POINT: scale each slice about the VP
     float vx = vpScreenX(), vy = vpScreenY();
@@ -812,18 +1046,26 @@ void drawExtrudeLevel(int d) {
       AffineTransform at = new AffineTransform(base);
       at.translate(vx, vy); at.scale(ratio, ratio); at.translate(-vx, -vy);
       sg.setTransform(at);                       // also scales the stroke -> thinner at back
-      stampExtrudeBody(sg, bands, nubs);
+      stampExtrudeBody(sg, bands, nubs, thinArg, bandW, motifW, cap);
     }
   }
   sg.setTransform(base);
   compositeExtrudeLayer(sg);
 }
 
-// One depth slice of the body: the level's bands + nubs in the side colour.
-void stampExtrudeBody(Graphics2D sg, Path2D.Float bands, ArrayList<float[]> nubs) {
+// One depth slice of the body: the level's bands + nubs (band width) and, if any,
+// the thin circuit motifs (proportional width) -- all in the side colour. The slice
+// transform (set by the caller) scales these strokes, so walls converge in 1-point.
+void stampExtrudeBody(Graphics2D sg, Path2D.Float bands, ArrayList<float[]> nubs,
+                      Path2D.Float thin, float bandW, float motifW, int cap) {
+  sg.setStroke(new BasicStroke(bandW, cap, BasicStroke.JOIN_ROUND));
   sg.draw(bands);
   for (float[] nb : nubs)
     sg.fill(new Ellipse2D.Float(nb[0] - nb[2], nb[1] - nb[2], 2 * nb[2], 2 * nb[2]));
+  if (thin != null) {
+    sg.setStroke(new BasicStroke(motifW, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+    sg.draw(thin);
+  }
 }
 
 Graphics2D beginExtrudeLayer() {
@@ -850,31 +1092,50 @@ void compositeExtrudeLayer(Graphics2D sg) {
 
 // True when bands should be painted with the canvas-wide gradient (scheme 4),
 // so each band's colour varies continuously across the canvas, not per tile.
-boolean gradientStroke() { return colorScheme == 4 && gradPaint != null; }
+boolean gradientStroke() {
+  if (colorScheme == 4 && gradPaint == null) dbg("NULL", "gradPaint null in scheme 4 (gradient-smooth)");
+  return colorScheme == 4 && gradPaint != null;
+}
 
 // Draw all of a tile's bands as ONE Java2D stroked path. Stroking a single path
 // (with each connection as a subpath) makes the whole motif one antialiased
 // shape: overlapping bands union cleanly, with no 1px seams or cusps where
 // separately-drawn strokes would meet (their AA edges otherwise leave hairline
 // gaps). Solid colour, or the canvas gradient paint in the gradient-smooth scheme.
+// The solid-band stroke. Classic: the side/3 band with the caller's cap and a
+// ROUND join. Kumiko style: a thin uniform strip (stripWidthFrac * side) with a
+// SQUARE cap + MITER join, the sharp woodwork-lattice look. animBandScale is
+// applied here so the one identity (off -> width = bandW * scale) stays exact.
+BasicStroke bandStroke(float bandW, float side, int cap) {
+  if (kumikoStyle)
+    return new BasicStroke(max(0.5, stripWidthFrac * side * animBandScale),
+                           BasicStroke.CAP_SQUARE, BasicStroke.JOIN_MITER);
+  return new BasicStroke(bandW * animBandScale, cap, BasicStroke.JOIN_ROUND);
+}
+
 void drawTileBands(TileGeom gm, color fg) {
   if (!gm.hasBands()) return;                 // blank tile
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  Path2D.Float path = new Path2D.Float();
-  gm.appendBands(path);
   // hexagon bands overlap across edges with a ROUND cap (no clip there); square/
   // triangle/trapezoid end flush (CAP_BUTT) and rely on wings to bridge the edge.
-  int cap = (gm.n == 6 && !gm.trap) ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
   g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
   if (lineMode) {                             // bundle of thin parallel/concentric lines
     Path2D.Float lines = new Path2D.Float();
-    for (float off : lineOffsets(gm.side / 3.0 * animBandScale)) gm.appendBandsOffset(lines, off);
+    for (float off : lineOffsets(lineBundleW(gm))) gm.appendBandsOffset(lines, off);
     g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
     g2.draw(lines);
     return;
   }
-  g2.setStroke(new BasicStroke(gm.side / 3.0 * animBandScale, cap, BasicStroke.JOIN_ROUND));
-  g2.draw(path);
+  // Regular bands at band width; circuit motifs at a thin proportional weight.
+  Path2D.Float bands = new Path2D.Float(), thin = new Path2D.Float();
+  gm.appendBandsSplit(bands, thin);
+  g2.setStroke(bandStroke(gm.bandW, gm.side, cap));
+  g2.draw(bands);
+  if (gm.hasThinMotif()) {
+    g2.setStroke(new BasicStroke(gm.motifStrokeW(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+    g2.draw(thin);
+  }
 }
 
 // Stroke all accumulated whole-hexagon bands as ONE shape (uniform colour), so
@@ -890,7 +1151,8 @@ void strokeHexBatch() {
     g2.setStroke(new BasicStroke(hexBatchSide / 3.0 * animBandScale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
     g2.draw(hexSolidBatch);
   }
-  g2.setStroke(new BasicStroke(hw, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  if (lineMode) g2.setStroke(new BasicStroke(hw, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+  else          g2.setStroke(bandStroke(hexBatchSide / 3.0, hexBatchSide, BasicStroke.CAP_ROUND));
   g2.draw(hexBatch);
 }
 
@@ -925,6 +1187,115 @@ void appendConn(Path2D.Float path, int i, int j, int n,
   }
 }
 
+// A centre-spoke junction: a straight band from the tile CENTRE (centroid of the
+// vertices) to each listed edge midpoint. A 3-spoke hub renders as a T/Y, the
+// spokes union at the centre into one clean shape. Each spoke enters its edge
+// perpendicular at the central third, so the tile stays seamless and multi-scale-
+// safe (2 spokes = a band, 4 = the CrossCross +). `cn` = { CONN_HUB, e0, e1, ... }.
+void appendHub(Path2D.Float path, int[] cn, int n,
+               float[] vx, float[] vy, float[] mx, float[] my, float offset) {
+  float cx = 0, cy = 0;
+  for (int k = 0; k < n; k++) { cx += vx[k]; cy += vy[k]; }
+  cx /= n; cy /= n;
+  for (int s = 1; s < cn.length; s++) {
+    int e = cn[s];
+    appendStraight(path, cx, cy, mx[e], my[e], offset);   // reuse perpendicular-offset helper
+  }
+}
+
+// An opposite-edge connection drawn as a hump/arch instead of a straight band:
+// a raised cosine from midpoint i to midpoint j, bulging toward the perpendicular
+// side. The raised cosine has ZERO slope at both ends, so the band enters each
+// edge horizontally (perpendicular) at the central third -- seamless, like a
+// straight band, but arched. Bulge = 0.30*chord keeps the stroke inside the tile.
+void appendHump(Path2D.Float path, int i, int j,
+                float[] mx, float[] my, float offset) {
+  float ax = mx[i], ay = my[i], bx = mx[j], by = my[j];
+  float dx = bx - ax, dy = by - ay;
+  float dl = max(1e-6, sqrt(dx * dx + dy * dy));
+  float nx = dy / dl, ny = -dx / dl;          // perpendicular (W->E gives (0,-1) = up = N)
+  float bulge = dl * 0.30;
+  int seg = max(12, ceil(dl / 3.0));
+  for (int k = 0; k <= seg; k++) {
+    float t = (float) k / seg;
+    float h = bulge * (1 - cos(TWO_PI * t)) / 2.0;   // 0 at ends, bulge at middle, flat tangents
+    float px = ax + dx * t + nx * (h + offset);
+    float py = ay + dy * t + ny * (h + offset);
+    if (k == 0) path.moveTo(px, py); else path.lineTo(px, py);
+  }
+}
+
+// ---- circuit-inspired primitives --------------------------------
+// An inline component (resistor / inductor / capacitor / stepped) between ports
+// A and B: straight leads + a motif in the middle, amplitude `amp` (perpendicular).
+// The motif is authored in a unit frame -- {sFrac (0..1 along A->B), d (px perp),
+// moveFlag?} -- then mapped to screen with `offset` folded into the perpendicular,
+// so the line-mode bundle becomes parallel copies (like a band).
+void appendComponent(Path2D.Float path, int code,
+                     float ax, float ay, float bx, float by, float amp, float offset) {
+  float dx = bx - ax, dy = by - ay;
+  float L  = max(1e-6, sqrt(dx * dx + dy * dy));
+  float ux = dx / L, uy = dy / L, wx = -uy, wy = ux;     // along, perpendicular
+  float[][] sd = componentSD(code, amp);
+  boolean started = false;
+  for (float[] p : sd) {
+    float s = p[0] * L, d = p[1] + offset;
+    float px = ax + ux * s + wx * d, py = ay + uy * s + wy * d;
+    if (!started || (p.length > 2 && p[2] == 1)) { path.moveTo(px, py); started = true; }
+    else path.lineTo(px, py);
+  }
+}
+
+// The unit-frame polyline of an inline component. Rows: {sFrac, dPx} or
+// {sFrac, dPx, 1} where the trailing 1 starts a new subpath (capacitor plates).
+float[][] componentSD(int code, float a) {
+  if (code == CONN_RES)                                  // resistor: sawtooth zigzag
+    return new float[][]{ {0,0},{0.30,0},{0.35,a},{0.45,-a},{0.55,a},{0.65,-a},{0.70,0},{1,0} };
+  if (code == CONN_STEP)                                 // stepped: square-wave crenellation (right angles)
+    return new float[][]{ {0,0},{0.2,0},{0.2,a},{0.4,a},{0.4,0},{0.6,0},{0.6,a},{0.8,a},{0.8,0},{1,0} };
+  if (code == CONN_CAP)                                  // capacitor: leads + two perpendicular plates, gap between
+    return new float[][]{ {0,0},{0.44,0}, {0.44,-a,1},{0.44,a}, {0.56,-a,1},{0.56,a}, {0.56,0,1},{1,0} };
+  // CONN_IND: inductor -- straight leads + 3 semicircular bumps (same side) over [0.25,0.75]
+  ArrayList<float[]> pts = new ArrayList<float[]>();
+  pts.add(new float[]{0,0}); pts.add(new float[]{0.25,0});
+  int nb = 3; float s0 = 0.25, w = 0.5 / nb;
+  for (int b = 0; b < nb; b++)
+    for (int q = 1; q <= 8; q++) { float t = q / 8.0; pts.add(new float[]{ s0 + w * (b + t), a * sin(PI * t) }); }
+  pts.add(new float[]{1,0});
+  return pts.toArray(new float[0][]);
+}
+
+// Stroke a point glyph (ground / arrow / cross) into `path`, in the inward-oriented
+// local frame (u = inward unit, w = perpendicular) centred at (px,py), base unit g.
+void emitGlyph(Path2D.Float path, int code, float px, float py,
+               float ux, float uy, float wx, float wy, float g) {
+  if (code == CONN_GROUND) {                             // stem + 3 decreasing bars
+    glyphSeg(path, px,py,ux,uy,wx,wy, 0,0,        1.4*g,0);
+    glyphSeg(path, px,py,ux,uy,wx,wy, 1.4*g,-1.4*g, 1.4*g,1.4*g);
+    glyphSeg(path, px,py,ux,uy,wx,wy, 2.0*g,-0.9*g, 2.0*g,0.9*g);
+    glyphSeg(path, px,py,ux,uy,wx,wy, 2.6*g,-0.45*g,2.6*g,0.45*g);
+  } else if (code == CONN_ARROW) {                       // shaft + inward chevron
+    glyphSeg(path, px,py,ux,uy,wx,wy, 0,0, 1.7*g,0);
+    glyphPt(path, px,py,ux,uy,wx,wy, 0.9*g,-g, true);
+    glyphPt(path, px,py,ux,uy,wx,wy, 1.7*g,0,  false);
+    glyphPt(path, px,py,ux,uy,wx,wy, 0.9*g,g,  false);
+  } else if (code == CONN_CROSS) {                       // plus centred on the port
+    glyphSeg(path, px,py,ux,uy,wx,wy, -g,0, g,0);
+    glyphSeg(path, px,py,ux,uy,wx,wy, 0,-g, 0,g);
+  }
+}
+// One local-frame segment (s = along inward u, t = along perpendicular w).
+void glyphSeg(Path2D.Float path, float px, float py, float ux, float uy, float wx, float wy,
+              float s0, float t0, float s1, float t1) {
+  path.moveTo(px + ux*s0 + wx*t0, py + uy*s0 + wy*t0);
+  path.lineTo(px + ux*s1 + wx*t1, py + uy*s1 + wy*t1);
+}
+void glyphPt(Path2D.Float path, float px, float py, float ux, float uy, float wx, float wy,
+             float s, float t, boolean move) {
+  float x = px + ux*s + wx*t, y = py + uy*s + wy*t;
+  if (move) path.moveTo(x, y); else path.lineTo(x, y);
+}
+
 // A straight band centre-line (ax,ay)->(bx,by), displaced perpendicular by `offset`.
 void appendStraight(Path2D.Float path, float ax, float ay, float bx, float by, float offset) {
   if (offset != 0) {
@@ -934,6 +1305,55 @@ void appendStraight(Path2D.Float path, float ax, float ay, float bx, float by, f
     ax += nx; ay += ny; bx += nx; by += ny;
   }
   path.moveTo(ax, ay); path.lineTo(bx, by);
+}
+
+// A ring centred at (cx,cy), centre-line radius r, as a closed circular subpath
+// (stroked at band width by the caller). `offset` shifts the radius, so line mode's
+// offset bundle becomes concentric rings (the target-circle look); offsets that
+// shrink the radius past ~0 are skipped.
+void appendCircle(Path2D.Float path, float cx, float cy, float r, float offset) {
+  float rr = (r * animArcRadius) + offset;
+  if (rr < 0.1) return;
+  int seg = max(16, ceil(TWO_PI * rr / 3.0));
+  for (int q = 0; q <= seg; q++) {
+    float a = TWO_PI * q / seg;
+    float px = cx + rr * cos(a), py = cy + rr * sin(a);
+    if (q == 0) path.moveTo(px, py); else path.lineTo(px, py);
+  }
+  path.closePath();
+}
+
+// cubic Bezier value + derivative at u (for multi-anchor connections).
+float bez(float p0, float p1, float p2, float p3, float u) {
+  float v = 1 - u;
+  return v*v*v*p0 + 3*v*v*u*p1 + 3*v*u*u*p2 + u*u*u*p3;
+}
+float bezD(float p0, float p1, float p2, float p3, float u) {
+  float v = 1 - u;
+  return 3*v*v*(p1-p0) + 6*v*u*(p2-p1) + 3*u*u*(p3-p2);
+}
+
+// True when two edges are within ~0.06 deg of parallel (|sin| < 1e-3), so a
+// multi-anchor connection across them is a bezier, not a (huge-radius) arc. Uses
+// the normalized direction cross product -> scale-invariant and FP-stable, so a
+// tile and its flipped twin always agree on the branch (see appendPortConn).
+boolean nearlyParallel(float ax, float ay, float bx, float by,
+                       float cx, float cy, float dx2, float dy2) {
+  float ux = bx - ax, uy = by - ay, vx2 = dx2 - cx, vy2 = dy2 - cy;
+  float lu = sqrt(ux*ux + uy*uy), lv = sqrt(vx2*vx2 + vy2*vy2);
+  if (lu < 1e-6 || lv < 1e-6) return true;
+  return abs(ux*vy2 - uy*vx2) / (lu*lv) < 1e-3;
+}
+
+// Unit normal of edge (ax,ay)->(bx,by), pointing INWARD (toward the tile centre
+// (cx,cy)) -- the band's tangent at an anchor (px,py) on that edge.
+float[] inwardNormal(float ax, float ay, float bx, float by,
+                     float px, float py, float cx, float cy) {
+  float dx = bx - ax, dy = by - ay;
+  float dl = max(1e-6, sqrt(dx*dx + dy*dy));
+  float nx = -dy / dl, ny = dx / dl;
+  if (nx * (cx - px) + ny * (cy - py) < 0) { nx = -nx; ny = -ny; }
+  return new float[]{ nx, ny };
 }
 
 // Processing colour int (0xAARRGGBB) -> opaque java.awt.Color.
@@ -982,6 +1402,7 @@ void popPolyClip(java.awt.Shape old) {
 int pickWeighted(float[] w) {
   float total = 0;
   for (float x : w) total += x;
+  if (total <= 0) return -1;          // no archetype has any weight -> a blank tile
   float r = random(total);
   for (int t = 0; t < w.length; t++) {
     r -= w[t];

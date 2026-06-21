@@ -135,6 +135,7 @@ void sortLibrary() {
 //  - contain (imgContain=true, default): scale the WHOLE image to fit and pad the
 //    rest with the bright background, so nothing is cropped -- good for logos.
 PImage sampleGrid(int cols, int rows) {
+  if (sourceImg == null) { dbg("NULL", "sourceImg null in sampleGrid (imagePath=" + imagePath + ")"); return null; }
   float targetAR = (float) cols / rows;
   float srcAR = (float) sourceImg.width / sourceImg.height;
 
@@ -211,6 +212,7 @@ void buildMosaic() {
 // on the main sketch, which is the callback object passed to selectInput.
 void imageChosen(File selection) {
   if (selection == null) return;            // user cancelled
+  logAction("LOAD image " + selection.getAbsolutePath());  // prime race suspect: nulls sourceImg
   imagePath = selection.getAbsolutePath();
   sourceImg = null;                          // force reload
   imageMode = true;

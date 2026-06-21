@@ -90,6 +90,14 @@ quarter-turn, so rotations cover the full square set:
 | `{0,2}` | single straight band |
 | `{0,1},{2,3}` | diagonal arc pair (classic Truchet) |
 | `{0,2},{1,3}` | crossing bands |
+| `{CONN_HUB,0,2,1}` | T/Y junction (centre spokes to 3 edges) |
+| `{CONN_HUMP,3,1}` | arch / hump (opposite-edge band, bulged) |
+
+The four‑edge matching set is complete at the first five rows. The last two are
+**tagged primitives** (first slot `>= CONN_TAG`, not an edge index): a centre‑spoke
+**hub** (a 3‑spoke hub is a T/Y; a band is 2 spokes, a cross is 4) and a **hump**
+(an opposite‑edge connection drawn as an arch). Both still enter each edge
+perpendicular at the central third, so they stay seamless and multi‑scale‑safe.
 
 ## Shapes (square / triangle / hexagon / trapezoid)
 

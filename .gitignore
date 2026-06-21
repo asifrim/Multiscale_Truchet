@@ -1,3 +1,13 @@
 truchet-*.png
 __pycache__/
 *.pyc
+
+# Saved render artifacts (parameter-stamped filenames; flat folder)
+hires/
+
+# Debug logs (TRUCHET_DEBUG / 'd' key)
+logs/
+
+# Local catalog backups/restore points (tiles.bak.json, tiles.generated.json, …);
+# the live catalog tiles.json is NOT matched by this pattern and stays tracked.
+tiles.*.json
