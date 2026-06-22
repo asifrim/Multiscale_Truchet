@@ -355,7 +355,7 @@ void drawRotationsColumn() {
 
 // Render one tile (its connection set) at a rotation of rotSteps·(2π/n). When
 // interactive, the geometry is cached for hit-testing and clickable edge markers
-// are drawn. Mirrors TileWindow.drawArchetype.
+// are drawn. Mirrors ControlWindow.drawArchetype (the tile-pane preview).
 void renderTile(ArrayList<int[]> cs, float ccx, float ccy, float sz, int rotSteps, boolean interactive) {
   int k = max(1, anchorsK);
   boolean wholeHex = (n == 6 && k == 1);

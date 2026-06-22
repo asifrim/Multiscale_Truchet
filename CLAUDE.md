@@ -29,9 +29,13 @@ is a WSL mount of a Windows drive.
 The Processing sketch folder name must match the `.pde` filename, so the main
 sketch must stay named `Multiscale_Truchet.pde` at the repo root.
 
-Running opens **three windows**: the visualization, a **Controls** panel, and a
-**Tiles** panel (per-shape archetype weights) — see "Multi-window architecture"
-below. Most parameters are adjustable live from the panels; the keyboard still
+Running opens **two windows**: the visualization and a single unified **Controls**
+panel (1920×1080). The panel has three zones: a vertical tab rail on the left, the
+active tab's parameter widgets in the middle column, and — always visible on the right
+— the **tile pane** (shape + anchors/side switches, the active tileset selector, and
+the 16 tile slots with per-tile weight sliders, the old separate "Tiles" window folded
+in). See "Multi-window architecture" below. Most parameters are adjustable live from the
+panel; the keyboard still
 works on the visualization window: **SPACE** = new seed, **4/3/6/t** =
 square/triangle/hexagon/trapezoid, **P/p** = prev/next palette, **R** = rotate palette
 (in duotone, instead assigns two random palette colours to fg/bg — see `rotatePalette`),
@@ -187,8 +191,8 @@ TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 TRUCHET_SEED=7 \
 renders one frame to `TRUCHET_OUT` and exits, skipping the GUI windows.
 
 **Debug logging** (`TRUCHET_DEBUG=1` env, or the **d** key live; main tab). A
-thread-tagged action+phase log for tracing crashes — built because the three windows
-(viz, Controls, Tiles) run on separate threads and mutate the shared globals, so the
+thread-tagged action+phase log for tracing crashes — built because the two windows
+(viz, Controls) run on separate threads and mutate the shared globals, so the
 prime suspect for the intermittent NPE is a **cross-thread race** (a panel edit swaps
 the catalog / nulls `gradPaint` / rebuilds `leaves` mid-render). The facility
 (`dbg`/`logAction`/`phase`/`dbgCrash`) prints `[+<s>][<thread>] CAT: msg` to the
@@ -264,12 +268,22 @@ original full-thickness stroke; `1` = all lines, plain line mode).
 Kumiko lattice style (thin mitered strips — see "Kumiko lattice style" below):
 `TRUCHET_KUMIKO` (0/1), `TRUCHET_STRIP` (strip width as a fraction of the tile
 side, default 0.10).
+Metal style (foreground ink shaded as metal — see "Metal material style" below):
+`TRUCHET_METAL` (0/1), `TRUCHET_METAL_MAT` (index OR name: gold/chrome/copper/steel/
+brass), `TRUCHET_METAL_STYLE` (0 round-bevel, 1 flat-rim), `TRUCHET_METAL_BEVEL`
+(bevel/rim width in px at 1080p, scaled by resolution, default 10),
+`TRUCHET_METAL_LIGHT` (key-light azimuth, degrees).
 Animation (headless verification of motion — the loop never starts in headless;
 these pin a single deterministic frame): `TRUCHET_ANIM_T` (seconds → LFO-driven
 frame at that phase), `TRUCHET_ANIM_RATE` (master LFO Hz), `TRUCHET_ANIM_DEPTH`
 (set all LFO depths so motion is visible), and `TRUCHET_ANIM="name=v01,..."` to
 pin exact registry values (e.g. `discMod=1.0`, `rotationMod=0.85`), which also
 exercises the future MIDI sink.
+Light pulse (comet along the connection paths — see `Pulse.pde`): `TRUCHET_PULSE`
+(0/1 enable), `TRUCHET_PULSE_SPEED` (px/s), `TRUCHET_PULSE_TRAIL` (comet trail px),
+`TRUCHET_PULSE_COUNT` (0 = all paths, else the N longest), `TRUCHET_PULSE_COLOR`
+(0 palette-bright / 1 white-hot / 2 complementary accent). Pin the comet position
+with `TRUCHET_ANIM_T` (the pulse rides the same deterministic `animSeconds` clock).
 Image mode ("Truchet halftone" — see `ImageMode.pde`): `TRUCHET_IMG` (path to a
 source image → enables image mode), `TRUCHET_IMG_COLS` (mosaic columns; rows
 derived from the canvas aspect, = `gridN` in image mode), `TRUCHET_IMG_LIB`
@@ -447,8 +461,8 @@ routes the circuit motifs (`thinMotif()` = `isInlineComp || isPointGlyph`) into 
 separate path from the regular bands; the solid (`drawTileBands`), shadow
 (`addTileShadow`), and extrude (`drawExtrudeLevel`/`stampExtrudeBody`) passes each
 stroke that path at `motifStrokeW()`. Line mode already strokes everything thin
-(`lineStroke`), so it is unchanged. Mirrored in the Tiles-panel preview
-(`TileWindow.drawArchConn`/`drawArchGlyph`, reusing `parent.componentSD`) and the
+(`lineStroke`), so it is unchanged. Mirrored in the tile-pane preview
+(`ControlWindow.drawArchConn`/`drawArchGlyph`, reusing `parent.componentSD`) and the
 standalone editor (`drawComponent`/`drawGlyph`).
 - **inline components** `[code, a, b]` join two ports with straight leads + a motif
   in the middle, amplitude `side/(3.5k)`. `appendComponent` maps a unit-frame
@@ -611,6 +625,51 @@ lattice, not via wing nubs). Wired into the filename (`_kumiko`+width%), `reprod
 and the render manifest (`kumiko`/`stripWidth`) like every other render global; a
 saved Kumiko frame re-renders byte-identical from its manifest (verified, max diff 0).
 
+### Metal material style (foreground ink as shaded metal)
+
+`metalMode` (Controls "metal" toggle on the Render tab, `TRUCHET_METAL`) renders the
+foreground **ink** as a metallic surface (gold / chrome / copper / steel / brass). A
+flat 2D shape has no surface normal, so the look hinges entirely on the **normal
+model** — an earlier matcap attempt assumed a half-tube (every ribbon a cylinder) and
+read as rubber. The fix (see `Metal.pde`): synthesise normals from a **signed distance
+field of the whole ink region**, so thin ribbons and the big inverted "flats" are
+treated identically, as a **flat metal top with a narrow chamfered edge**. No
+OpenGL/GLSL and no external assets — it is plain Java2D + a per-pixel pass.
+
+Pipeline (`drawMetalTiling`, hooked first in `renderTiling`, gated `if (metalMode)`;
+it needs the whole figure at once so it replaces the per-level foreground passes):
+1. **`buildInkMask`** — render the duotone figure/ground in grayscale (ink = white,
+   paper = black), coarse-first (backgrounds then foregrounds per level), **AA on** so
+   the white coverage at the silhouette doubles as a clean edge alpha. Ink is the
+   ribbons on normal levels and the **background mass** on inverted levels
+   (`tileInkInverted`), bands carved back out as paper — so the inverted flats become
+   metal too (the thing the matcap couldn't do). Non-duotone schemes treat the
+   foreground as ink.
+2. **`edtSquared`** — exact Euclidean distance transform (Felzenszwalb & Huttenlocher,
+   separable 1D passes) → distance-to-edge per ink pixel.
+3. **`shadeMetalLayer`** — per pixel: outward direction = −gradient of the (box-blurred)
+   distance; **round-bevel** tilts the normal up only within `bevel` px of the edge
+   (flat top elsewhere), **flat-rim** keeps the top flat and adds a bright bevelled lip
+   at the edge. The normal is shaded as metal (`shadeMetalPixel`: Blinn-Phong + a
+   2-stop environment reflection + Fresnel; metals tint the environment by the base
+   colour). AA coverage from step 1 is the output alpha → crisp anti-aliased silhouette.
+4. Composite the ARGB metal layer over the paper canvas (`background(canvasBgColor())`
+   already laid the light paper down, which also shows through the carved channels).
+
+Two **bevel styles** (toggle/`TRUCHET_METAL_STYLE`): `0` round-bevel (dimensional cut
+metal), `1` flat-rim (flat foil with a highlighted edge). `metalBevelPx` (the "bevel
+width" slider) is px at 1080p, scaled by resolution so it is export-independent;
+`metalLightDeg` rotates the key light. Works across all shapes (square/triangle/
+hexagon/trapezoid) and k. **Off ⇒ byte-identical** (single gated branch in
+`renderTiling`; verified). Wired into the filename (`_metal-<name>[-rim]`, +`b`/`l`
+when bevel/light deviate), `reproduceCmd`, and the render manifest (`metal`/`metalMat`/
+`metalStyle`/`metalBevel`/`metalLight`); a saved metal frame re-renders byte-identical
+from its manifest (verified). **Interactions:** the background stays the flat paper
+colour (only the ink is materialised); under image mode a metal change sets `imgDirty`
+(it changes patch brightness). Cost: a full-canvas EDT + per-pixel shade — fine at
+1080p, a few seconds at 8K (a render-time pass, not for live animation). A future
+option is a GLSL/deferred lighting pass for speed + true cubemap reflections.
+
 ## Structure of the sketch
 
 The `.pde` tabs are merged into one PApplet:
@@ -741,57 +800,61 @@ The `.pde` tabs are merged into one PApplet:
   from the COLOURlovers all-time most-loved list (hex verified against two
   verbatim top-100 dumps); `loadFromColourLovers()` can still refresh live but is
   Cloudflare-blocked in practice. To bake in more, add `fromHex(...)` lines there.
-- **`ControlWindow.pde`** — a second PApplet (own window, launched in `setup()`
-  via `runSketch`) with immediate-mode sliders/buttons writing straight to the
-  main sketch's globals (`parent.*`) and calling `parent.redraw()`. **Tabbed
-  layout:** controls are grouped into seven switchable tabs — **Tiles** (shape +
-  anchors/side as segmented switches — a row of shape-pictogram buttons and a row
-  of 1–4 number buttons, each custom-drawn via `drawShapeButton`/`drawSegButton`/
-  `drawShapePicto` and hit-tested in the `TAB_TILES` branch rather than registered
-  in the `buttons` list; then grid, depth, subdiv sliders + winged, grid overlay
-  toggles), **Color** (scheme, palette
-  prev/next/rotate + swatches, invert/level), **Sym** (symmetry mode + a help
-  blurb), **Shadow** (drop/global shadow + angle/size/strength, extrude 3D + mode,
-  vp x/y, extrude depth/shade), **Anim** (animate, rate, disc/band/rot/arc depth),
-  **Render** (line mode, count/duty/subdiv, kumiko style, strip width), and
-  **Image** (image mode + halftone params + Load image). A **persistent bottom
-  action bar** (tab `-1`: New seed / Save PNG / Load render…) shows on every tab.
-  Each widget carries a `tab` index; `draw()`/`mousePressed()` only render and
-  hit-test the active tab's widgets (plus tab `-1`), and every tab lays out from
-  the shared `contentTop` (tabs reuse the same vertical space — so the panel is
-  compact, `480×560`). A click on the tab bar (`tabAt`) just sets `activeTab`. If
-  you add a tunable global, add a widget here too (via the `addSlider`/`addToggle`/
-  `addButton` factory helpers, passing the owning tab) — and extend **both**
-  `syncParent()` (widgets → globals, on edit) and `syncFromParent()` (globals →
-  widgets, after a manifest load sets `controlsNeedSync`), or the panel drifts out
-  of agreement. **Wiring is by named reference** (`sGrid`, `tgShadow`, …), *not*
-  list index — so widgets can be freely reordered across tabs without misbinding a
-  control (the old layout was index-based and fragile: a new slider had to be
-  appended last to keep positions put). The "Load render…" button `selectInput`s a
-  manifest → `manifestChosen`; "Load image…" → `imageChosen`. Image-mode widgets
-  set `imgDirty`.
-- **`TileWindow.pde`** — a third PApplet window for the active shape's **active
-  tileset**. A **tileset selector strip** at the top (`◀ / label / ▶`, via
-  `parent.setActiveTileset(±1)` + `parent.tilesetCount()`/`activeTilesetOrdinal()`)
-  switches which 16-tile set is active for the current (shape, k); below it the grid
-  lists that tileset's 16 slots (`parent.connsFor(n)`, or `parent.TRAP_CONNS` for the
-  trapezoid — built-in, not a tileset, so the selector is hidden for it) with a slider
-  per slot that writes its weight into `parent.weightsFor(n)` / `parent.TRAP_W` **in
-  place** (the same array `pickWeighted` reads) and calls `parent.redraw()`. It draws
-  each slot with its own `drawArchetype()` (a compact copy of the band geometry, using
-  `parent.lineIntersect`) — or `drawTrapArchetype()` (sampling `parent.trapArcSpec`)
-  for the trapezoid — since drawing must target *this* window's canvas, not the main
-  one. It reads `parent.shapeMode`/`anchorsPerSide` each frame, so it relists
-  automatically. Slots are laid out in a **dense 2-column grid**
-  (`cols`/`rowH`/`tileSz` + the `cellX`/`trkX0`/`trkX1` per-column helpers);
-  `mousePressed`/`setWeight` map a click back to `(col, row) -> index`. A **"Reload
-  tiles.json"** button in the header re-reads the catalog *without restarting* — it
-  sets `parent.reloadCatalogRequested` (a flag, like the Save button, so the swap runs
-  on the viz thread at the top of `draw()`, not cross-thread); `draw()` then calls
-  `loadTileCatalog()` + sets `dirtyLayout`. Because `loadTileCatalog`/`applyCatalog`
-  reassign the tileset maps in place and the panels read them by reference, newly
-  authored tilesets appear immediately — this is the live-reload the "author →
-  restart" workflow used to require.
+- **`ControlWindow.pde`** — the single unified control panel: a second PApplet
+  (own window, `1920×1080`, launched in `setup()` via `runSketch`) with immediate-mode
+  sliders/buttons writing straight to the main sketch's globals (`parent.*`) and calling
+  `parent.redraw()`. **Three zones** (`draw()` → `drawRail()` / `drawControlColumn()` /
+  `drawTilePane()`, with zone backgrounds + divider lines):
+  - **Left tab rail** — a vertical stack of the seven tab buttons (`drawRail`/`tabAt`
+    are vertical now). A click sets `activeTab`.
+  - **Middle control column** — the active tab's widgets, laid out from the shared
+    `contentTop` (tabs reuse the same vertical space): **Tiles** (grid, depth, subdiv
+    sliders + winged, grid-overlay toggles), **Color** (scheme, palette
+    prev/next/rotate + swatches, invert/level), **Sym** (symmetry mode + a help blurb),
+    **Shadow** (drop/global shadow + angle/size/strength, extrude 3D + mode, vp x/y,
+    extrude depth/shade), **Anim** (animate, rate, disc/band/rot/arc depth), **Render**
+    (line mode, count/duty/subdiv, kumiko style, strip width), and **Image** (image mode
+    + halftone params + Load image). Each widget carries a `tab` index;
+    `draw()`/`mousePressed()` only render + hit-test the active tab's widgets (plus the
+    `tab -1` **persistent action bar** — New seed / Save PNG / Load render… — at the
+    column bottom). **Wiring is by named reference** (`sGrid`, `tgShadow`, …), *not* list
+    index, so widgets can be freely reordered without misbinding. The "Load render…"
+    button `selectInput`s a manifest → `manifestChosen`; "Load image…" → `imageChosen`.
+    Image-mode widgets set `imgDirty`. If you add a tunable global, add a widget here too
+    (via the `addSlider`/`addToggle`/`addButton` factory helpers, passing the owning tab)
+    — and extend **both** `syncParent()` (widgets → globals, on edit) and
+    `syncFromParent()` (globals → widgets, after a manifest load sets `controlsNeedSync`),
+    or the panel drifts out of agreement.
+  - **Right tile pane** (`drawTilePane`, always visible — folded in from the old
+    separate Tiles window) — for the active shape's **active tileset**. A header carries
+    the **shape + anchors/side** segmented switches (a row of shape-pictogram buttons and
+    a row of 1–4 number buttons, custom-drawn via `drawShapeButton`/`drawSegButton`/
+    `drawShapePicto`, hit-tested in `tilePanePressed()` — they drive which tileset shows),
+    a **tileset selector** (`◀ / label / ▶`, via `parent.setActiveTileset(±1)` +
+    `parent.tilesetCount()`/`activeTilesetOrdinal()`; hidden for the built-in trapezoid),
+    and **Reload tiles.json** / **Reset weights** buttons. Below, a roomy **2-column grid
+    of 16 slot cards** lists the tileset's slots (`parent.connsFor(n)`, or
+    `parent.TRAP_CONNS` for the trapezoid) each with a large preview, a **solo** button,
+    and a weight slider that writes into `parent.weightsFor(n)` / `parent.TRAP_W` **in
+    place** (the same array `pickWeighted` reads — NOT part of `syncParent`). Each slot is
+    drawn by `drawArchetype()` (band geometry via `parent.lineIntersect`, with
+    hub/hump/glyph/component branches in `drawArchConn`/`drawArchGlyph`) or
+    `drawTrapArchetype()` (sampling `parent.trapArcSpec`). It reads
+    `parent.shapeMode`/`anchorsPerSide` each frame, so it relists automatically. Tile-pane
+    geometry helpers are pane-prefixed (`tileCellX`/`tileTrkX0`/`tileTrkX1`/`soloX`) to
+    avoid colliding with the control-column slider helpers (`trkX0(Slider)`/`trkX1(Slider)`).
+    **Reload tiles.json** re-reads the catalog *without restarting* — it sets
+    `parent.reloadCatalogRequested` (a flag, like the Save button, so the swap runs on the
+    viz thread at the top of `draw()`, not cross-thread); `draw()` then calls
+    `loadTileCatalog()` + sets `dirtyLayout`. Because `loadTileCatalog`/`applyCatalog`
+    reassign the tileset maps in place and the panel reads them by reference, newly
+    authored tilesets appear immediately — the live-reload the "author → restart" workflow
+    used to require.
+  - **Headless panel verification** (the project forbids screenshotting windows):
+    `TRUCHET_PANEL_OUT=path` dumps the panel's first fully-drawn frame to `path` and exits
+    (the `save()` + `System.exit` live at the end of `ControlWindow.draw()`); pair it with
+    `TRUCHET_PANEL_TAB=0..6` to open on a specific tab and the usual `TRUCHET_SHAPE`/
+    `TRUCHET_ANCHORS`/etc. to pin the pane's state. Mirrors `TILEEDITOR_OUT`.
 - **`Animation.pde`** — the animation engine. The tile layout is stable per seed,
   so animation never rebuilds tiles: it modulates *render-time* geometry. A small
   registry (`AnimState anim`, normalized `volatile` `-1..+1` values:
@@ -809,7 +872,41 @@ The `.pde` tabs are merged into one PApplet:
   expressive set): `bandWidthMod`, `arcSweepMod`, `arcRadiusMod`, `rotationMod` —
   they move band edge-crossings off the 1/3–2/3 points so ribbons no longer meet at
   edges. Controls default the safe channel on, breaking ones at depth 0 (labelled
-  `*` in the panel).
+  `*` in the panel). The registry also carries `pulseSpeedMod/pulseWidthMod/
+  pulseGlowMod` for the light-pulse overlay (see `Pulse.pde`).
+- **`Pulse.pde`** — an animated **light pulse** (comet: bright head + fading trail)
+  flowing along the connection curves, like energy through an energized circuit. It
+  is a pure **overlay**: never touches `leaves`/`dirtyLayout`, fully gated (off ⇒
+  output byte-identical). **Path graph** (`rebuildPulsePaths`, cached): per leaf,
+  `TileGeom.sampleBand(ci)` returns each "wire" connection's centre-line polyline
+  (plain pairs/straight/hump/inline-component-chord; dots/rings/glyphs/hubs
+  excluded); endpoints are spatial-hashed (`PULSE_QUANT` ≈0.35px, 3×3 neighbour
+  probe) so segments sharing a coordinate link into **chains + loops** (band ends
+  carry ≤1 conn/tile → mostly degree-≤2). Built on **neutral geometry** (anim
+  frame-globals frozen to identity around the build) so the graph is layout-only and
+  stable; rebuilt from `rebuildLeaves` (sets `dirtyPaths`) + the `draw()` guard.
+  **Cross-scale bridging:** for k=1 a centre-line crosses an edge at its *midpoint*
+  (½), but a coarse↔fine boundary puts the fine midpoints at ¼/¾ — so centre-lines
+  don't share a node (only the filled band *regions* abut). A bridging pass greedily
+  connects nearby degree-1 open-ends (within ≈`1.3·max(bandW)` — the edge/4 gap) with
+  a short connector segment, **keeping every node degree ≤2** so the simple chain/loop
+  tracer still works — this lets a comet flow across scale seams and merges short
+  runs into longer paths. (Genuine terminals where the neighbour has no band stay
+  open — the comet fades there; `interiorOpenEnds` under `TRUCHET_DEBUG` tracks how
+  many remain.) **Pulse model**: head arc-pos `= speed·animSeconds + per-path phase`,
+  deterministic + looping; closed loops wrap seamlessly, open paths slide in/out past
+  the ends (fade). **Glow**: an offscreen `glowLayer` (cloning the extrude-layer idiom)
+  stroked as segmented sub-spans with head→tail alpha falloff and a 3-stroke bloom;
+  the glow **fills the LOCAL band width** (`PulsePath.w` stores per-sample band width,
+  so the comet lights up whatever ribbon it's in — thick on coarse, thin on fine — and
+  transitions across a bridged scale seam), with a soft halo just outside and a bright
+  inner core; colour is a **complementary accent** (`pulseRGB`, palette-bright /
+  white-hot alternatives via `pulseColorMode`). Composited in `draw()` **between `renderTiling()` and
+  `applySymmetry()`** so pixel mirrors reflect the comets. Globals
+  `pulseEnabled/pulseSpeed/pulseTrail/pulseCount` (Controls "Anim" tab toggle +
+  sliders; `pulseCount` 0 = all paths). Headless: `TRUCHET_PULSE` (+`_SPEED/_TRAIL/
+  _COUNT/_COLOR`); phase pins via the existing `TRUCHET_ANIM_T`. Cross-scale
+  health diagnostic (`TRUCHET_DEBUG`): `interiorOpenEnds` count.
 - **`ImageMode.pde`** — **Truchet halftone**: render a source image as a mosaic of
   multi-scale Truchet patches chosen by brightness (ASCII-art, but the "glyphs"
   are little tilings). Two phases, both reusing `collectTile` + `renderTiling`:
@@ -839,6 +936,12 @@ The `.pde` tabs are merged into one PApplet:
   neighbours' overlapping wings — acceptable, and the histogram-stretch + nearest
   match absorb it. If you change tile geometry/colour, the library must be
   remeasured (it is, on `imgDirty`).**
+- **`Metal.pde`** — the **metal material style** (see "Metal material style" above):
+  material presets (`MetalMat`/`buildMetalMats`), the per-pixel metal shader
+  (`shadeMetalPixel`), the separable exact-EDT distance transform (`edtSquared`/
+  `edt1d`), the 1-bit ink-mask render (`buildInkMask`/`maskTileBg`/`maskTileFg`,
+  `tileInkInverted`), and `drawMetalTiling` which ties SDF → normals → shade →
+  composite. Self-contained Java2D (no OpenGL/GLSL).
 - **Layout caching** (main tab): `leaves`/gradient are rebuilt only when
   `dirtyLayout`/`dirtyGradient` are set (in `rebuildLeaves`/`setupGradient` guards),
   not every animated frame. Every layout-affecting mutator (seed, grid, depth,
@@ -964,26 +1067,25 @@ old renders still reproduce.
     TILEEDITOR_ANCHORS=2 TILEEDITOR_SLOT=0 TILEEDITOR_CONNS="1-2,3-4,5-6,7-0"`.
 - Being a separate sketch, the editor **duplicates** the few geometry bits it
   needs (`lineIntersect`, and the vertex/edge-midpoint + band/arc construction
-  copied from `TileWindow.drawArchetype`, including the hub/hump render branches so
+  copied from `ControlWindow.drawArchetype`, including the hub/hump render branches so
   loaded motifs preview correctly) rather than sharing them. It uses the same
-  `rot`/`R` convention as `drawArchetype`, so a preview matches the Tiles panel and
+  `rot`/`R` convention as `drawArchetype`, so a preview matches the tile pane and
   the canvas. Edge indices are rotation-invariant for tiling, so one representative
   orientation suffices. No connectivity rule is enforced — crossing bands (square
   `[0,2],[1,3]`) and **multiple connections sharing one edge** are both allowed.
-  `TileWindow`'s
+  The tile pane's
   in-memory weight edits are *not* persisted; on restart `tiles.json` wins (the
   editor is the catalog's source of truth).
 
 ## Multi-window architecture (control panels)
 
-The GUI panels are **separate `PApplet`s**, not a GUI library. Processing
+The GUI panel is a **separate `PApplet`**, not a GUI library. Processing
 supports multiple windows by running additional `PApplet` instances; the main
-sketch's `setup()` launches each with
-`PApplet.runSketch(new String[]{"..."}, win)` and hands it a `parent`
-reference back to the main sketch (currently two: `ControlWindow` and
-`TileWindow`). Widgets are drawn immediate-mode (custom sliders/toggles/buttons)
-— no G4P/ControlP5 dependency. The points below say "control window" but apply to
-both panels.
+sketch's `setup()` launches the panel with
+`PApplet.runSketch(new String[]{"Controls"}, controls)` and hands it a `parent`
+reference back to the main sketch (one panel now: `ControlWindow`, which absorbed
+the former separate `TileWindow`). Widgets are drawn immediate-mode (custom
+sliders/toggles/buttons) — no G4P/ControlP5 dependency.
 
 Gotchas that matter when editing this:
 

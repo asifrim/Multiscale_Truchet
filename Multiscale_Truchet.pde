@@ -145,11 +145,12 @@ float   gradCos, gradSin, gradMin, gradSpan;   // gradient axis + projection ran
 LinearGradientPaint gradPaint;  // Java2D paint matching the gradient (smooth schemes)
 
 PaletteManager palettes;        // colour source (see Palettes.pde), set in setup()
-ControlWindow  controls;        // parameter GUI window (see ControlWindow.pde), set in setup()
-TileWindow     tilesWin;        // per-shape tile-weight editor (see TileWindow.pde), set in setup()
+ControlWindow  controls;        // unified GUI window (params + tile pane; see ControlWindow.pde), set in setup()
 boolean saveRequested = false;  // set by the control window's Save button, handled in draw()
 boolean reloadCatalogRequested = false;  // set by the Tiles panel's Reload button; re-reads tiles.json in draw()
 String  autosavePath  = null;   // TRUCHET_OUT env var: render once to this file, then exit
+String  panelOutPath  = null;   // TRUCHET_PANEL_OUT: dump the control panel's first frame, then exit
+int     panelTab      = -1;     // TRUCHET_PANEL_TAB: open the panel on this tab (verification only)
 boolean manifestLoaded = false; // a render manifest (TRUCHET_LOAD / Load render button) set the state
 boolean controlsNeedSync = false; // ask ControlWindow to refresh its widgets from the globals
 
@@ -585,6 +586,13 @@ void setup() {
   // to TRUCHET_OUT and the sketch exits. Example:
   //   TRUCHET_OUT=/tmp/out.png TRUCHET_SHAPE=2 processing-java --sketch=... --run
   autosavePath = System.getenv("TRUCHET_OUT");
+  // TRUCHET_PANEL_OUT: headless verification of the control panel itself -- launch the
+  // panel (the viz also opens), dump its first fully-drawn frame to this path, and quit
+  // (the dump + System.exit live in ControlWindow.draw()). Mirrors TILEEDITOR_OUT, since
+  // the project rule is to make the sketch render its own image, never screenshot a window.
+  panelOutPath = System.getenv("TRUCHET_PANEL_OUT");
+  String envPanelTab = System.getenv("TRUCHET_PANEL_TAB"); // open the panel on this tab (0..6), for verification
+  if (envPanelTab != null) panelTab = Integer.parseInt(envPanelTab.trim());
   // TRUCHET_LOAD: restore a full render manifest as the baseline state (the complete,
   // reproducible recipe -- globals + tile catalog + palette). Parsed first so any
   // explicit TRUCHET_* override below still wins (e.g. load a frame, bump TRUCHET_SCALE).
@@ -637,6 +645,16 @@ void setup() {
   if (envKum != null)    kumikoStyle = !envKum.trim().equals("0");
   String envStrip  = System.getenv("TRUCHET_STRIP");       // Kumiko strip width (fraction of side)
   if (envStrip != null)  stripWidthFrac = constrain(Float.parseFloat(envStrip.trim()), 0.01, 0.33);
+  String envMet    = System.getenv("TRUCHET_METAL");       // 0/1: SDF metallic shading
+  if (envMet != null)    metalMode   = !envMet.trim().equals("0");
+  String envMetMat = System.getenv("TRUCHET_METAL_MAT");   // material index or name
+  if (envMetMat != null) metalMaterial = parseMetalMat(envMetMat.trim());
+  String envMetBev = System.getenv("TRUCHET_METAL_BEVEL"); // bevel/rim width (px at 1080p)
+  if (envMetBev != null) metalBevelPx = constrain(Float.parseFloat(envMetBev.trim()), 1, 60);
+  String envMetSty = System.getenv("TRUCHET_METAL_STYLE"); // 0 round-bevel, 1 flat-rim
+  if (envMetSty != null) metalBevelStyle = constrain(Integer.parseInt(envMetSty.trim()), 0, 1);
+  String envMetLit = System.getenv("TRUCHET_METAL_LIGHT"); // light azimuth (degrees)
+  if (envMetLit != null) metalLightDeg = Float.parseFloat(envMetLit.trim());
   String envGrid   = System.getenv("TRUCHET_GRID");    // top-level cells per side
   if (envGrid != null)   gridN       = constrain(Integer.parseInt(envGrid.trim()), 2, 16);
   String envDepth  = System.getenv("TRUCHET_DEPTH");   // max subdivisions (0 = single scale)
@@ -677,6 +695,30 @@ void setup() {
       if (kv.length == 2) setAnimValue(kv[0].trim(), Float.parseFloat(kv[1].trim()));
     }
   }
+  // --- light pulse (comet flowing along the connection paths; see Pulse.pde) ---
+  String envPulse = System.getenv("TRUCHET_PULSE");        // 0/1 enable
+  if (envPulse != null && !envPulse.trim().equals("0")) { pulseEnabled = true; headlessPulse = true; }
+  String envPSpd = System.getenv("TRUCHET_PULSE_SPEED");   // px/sec
+  if (envPSpd != null) pulseSpeed = Float.parseFloat(envPSpd.trim());
+  String envPTr  = System.getenv("TRUCHET_PULSE_TRAIL");   // comet trail length (px)
+  if (envPTr != null) pulseTrail = Float.parseFloat(envPTr.trim());
+  String envPCnt = System.getenv("TRUCHET_PULSE_COUNT");   // 0 = all paths, else N longest
+  if (envPCnt != null) pulseCount = max(0, Integer.parseInt(envPCnt.trim()));
+  String envPCol = System.getenv("TRUCHET_PULSE_COLOR");   // 0 palette-bright / 1 white / 2 complementary
+  if (envPCol != null) pulseColorMode = constrain(Integer.parseInt(envPCol.trim()), 0, 2);
+
+  // --- one-shot tile morph (headless: pin a single mid-morph frame) ---
+  String envMorph = System.getenv("TRUCHET_MORPH");        // 0/1 enable
+  if (envMorph != null && !envMorph.trim().equals("0")) { morphActive = true; headlessMorph = true; }
+  String envMDur = System.getenv("TRUCHET_MORPH_DUR");     // seconds (GUI playback)
+  if (envMDur != null) morphDurationSec = max(0.05, Float.parseFloat(envMDur.trim()));
+  String envMT = System.getenv("TRUCHET_MORPH_T");         // pin the morph phase 0..1
+  if (envMT != null) { morphT = constrain(Float.parseFloat(envMT.trim()), 0, 1); morphActive = true; headlessMorph = true; }
+  String envMGen = System.getenv("TRUCHET_MORPH_GEN");     // which target roll (default 0)
+  if (envMGen != null) morphGen = Integer.parseInt(envMGen.trim());
+  String envMSpr = System.getenv("TRUCHET_MORPH_SPREAD");  // 0 in-sync, >0 staggered start/finish
+  if (envMSpr != null) morphSpread = constrain(Float.parseFloat(envMSpr.trim()), 0, 0.9);
+
   // --- image mode (Truchet halftone of a source image) ---
   String envImg = System.getenv("TRUCHET_IMG");          // path -> enable image mode
   if (envImg != null && envImg.trim().length() > 0) { imagePath = envImg.trim(); imageMode = true; }
@@ -706,8 +748,6 @@ void setup() {
   // here, edits the globals above, and calls redraw() (the viz is noLoop()).
   controls = new ControlWindow(this);
   PApplet.runSketch(new String[]{"Controls"}, controls);
-  tilesWin = new TileWindow(this);
-  PApplet.runSketch(new String[]{"Tiles"}, tilesWin);
 }
 
 void draw() {
@@ -727,6 +767,11 @@ void draw() {
     reloadCatalogRequested = false;
     dirtyLayout = true;
   }
+
+  // Controls "morph" button -> start the one-shot morph on the viz thread (so the
+  // leaves' target motifs aren't rolled cross-thread mid-render).
+  if (morphRequested) { morphRequested = false; logAction("morph start"); startMorph(); }
+  if (morphStaggerRequested) { morphStaggerRequested = false; logAction("morph start (staggered)"); startMorphStaggered(); }
 
   // gradient + layout are deterministic from seed/params -> rebuild only when a
   // mutator marked them dirty, not every animated frame.
@@ -762,9 +807,18 @@ void draw() {
     // 1. build the leaf tiling (cached; see rebuildLeaves).
     if (dirtyLayout) { phase("rebuildLeaves"); rebuildLeaves(); dirtyLayout = false; }
 
+    // 1b. light-pulse path graph (cached; rebuilt with the layout, or when the
+    //     pulse is toggled on at runtime). See Pulse.pde.
+    if (dirtyPaths) { phase("rebuildPulsePaths"); rebuildPulsePaths(); dirtyPaths = false; }
+
     // 2. draw the tiling coarse-first (see renderTiling).
     phase("renderTiling");
     renderTiling();
+
+    // 2b. light-pulse overlay: comets flowing along the connection paths. Drawn
+    //     BEFORE applySymmetry so the pixel mirrors reflect the pulses too.
+    phase("drawPulses");
+    drawPulses();
 
     // 3. mirror symmetry (modes 1-3): reflect the rendered pixels about
     //    grid-aligned axes. (Mode 4, rot 180, is tile-level -- see step 1.)
@@ -814,6 +868,13 @@ void renderTiling() {
   hexBatch = new Path2D.Float();
   hexSolidBatch = new Path2D.Float();
   hexBatchUsed = false;
+  if (metalMode) {
+    // METAL: synthesise normals for the whole ink region via an SDF and shade it as
+    // metal, composited over the paper canvas. Replaces the normal foreground passes
+    // (it needs the whole figure at once for the distance field). See Metal.pde.
+    drawMetalTiling();
+    return;
+  }
   if (extrude3D) {
     // 3D EXTRUSION: lay down ALL backgrounds first (so a finer tile's background
     // can never chop a coarser ribbon's wall), then the optional drop shadow on
@@ -963,6 +1024,8 @@ void rebuildLeaves() {
   }
   if (rot180)        addRotatedTwins();
   if (vMir || hMir)  addSymTwins(vMir, hMir);
+  if (morphActive)   rollMorphTargets();   // a layout rebuild during a morph re-rolls targets
+  dirtyPaths = true;     // the light-pulse path graph derives from `leaves`
 }
 
 // Recursively subdivide a tile (per its shape) or record it as a leaf.
@@ -1149,6 +1212,7 @@ void collectSym(Tile t, boolean vMir, boolean hMir) {
     for (Tile c : children(t)) collectSym(c, vMir, hMir);
   } else {
     pickSymmetricMotifMulti(t, onV, onH);
+    t.straddle = true;          // on a symmetry axis -> morph target must stay symmetric
     leaves.add(t);
   }
 }
@@ -1522,6 +1586,13 @@ String appearanceTokens() {
     s += "_kumiko";
     if (round(stripWidthFrac * 100) != 10) s += round(stripWidthFrac * 100);   // strip width %
   }
+  if (metalMode) {
+    s += "_metal-" + metalMatName() + (metalBevelStyle == 1 ? "-rim" : "");    // material always shown
+    if (round(metalBevelPx) != 10)  s += "b" + round(metalBevelPx);
+    if (round(metalLightDeg) != 118) s += "l" + round(metalLightDeg);
+  }
+  if (morphActive) s += "_morph" + round(morphT * 100) + "g" + morphGen          // mid-morph frame
+                      + (morphSpread > 0 ? "s" + round(morphSpread * 100) : "");  // staggered
   return s;
 }
 
@@ -1543,6 +1614,11 @@ String reproduceCmd(String base) {
     + " TRUCHET_LINE_SUBDIV=" + nf(lineSubdivProb, 1, 2)
     + " TRUCHET_KUMIKO=" + (kumikoStyle ? 1 : 0)
     + " TRUCHET_STRIP=" + nf(stripWidthFrac, 1, 2)
+    + " TRUCHET_METAL=" + (metalMode ? 1 : 0)
+    + " TRUCHET_METAL_MAT=" + metalMaterial
+    + " TRUCHET_METAL_BEVEL=" + round(metalBevelPx)
+    + " TRUCHET_METAL_STYLE=" + metalBevelStyle
+    + " TRUCHET_METAL_LIGHT=" + nf(metalLightDeg, 1, 1)
     + (duoRandom ? " TRUCHET_DUO=" + duoBgIdx + "," + duoFgIdx : "");
   if (imageMode && imagePath != null) {
     cmd += " TRUCHET_IMG=" + imagePath
@@ -1576,6 +1652,9 @@ String reproduceCmd(String base) {
         + " TRUCHET_EXTRUDE_SHADE=" + nf(extrudeShade, 1, 2);
     }
   }
+  if (morphActive)      // a mid-morph frame: pin the phase + which target roll + stagger
+    cmd += " TRUCHET_MORPH=1 TRUCHET_MORPH_T=" + nf(morphT, 1, 3) + " TRUCHET_MORPH_GEN=" + morphGen
+         + " TRUCHET_MORPH_SPREAD=" + nf(morphSpread, 1, 2);
   cmd += " TRUCHET_OUT=" + renderDir() + base + "_hires.png"
     + " processing-java --sketch=" + sketchPath("") + " --run";
   return cmd;
@@ -1608,9 +1687,14 @@ JSONObject renderManifest() {
   r.setBoolean("line", lineMode);        r.setInt("lineCount", lineCount);
   r.setFloat("lineDuty", lineDuty);      r.setFloat("lineSubdiv", lineSubdivProb);
   r.setBoolean("kumiko", kumikoStyle);   r.setFloat("stripWidth", stripWidthFrac);
+  r.setBoolean("metal", metalMode);      r.setInt("metalMat", metalMaterial);
+  r.setInt("metalStyle", metalBevelStyle); r.setFloat("metalBevel", metalBevelPx);
+  r.setFloat("metalLight", metalLightDeg);
   r.setBoolean("extrude", extrude3D);    r.setInt("extrudeMode", extrudeMode);
   r.setFloat("vpX", vpX);                r.setFloat("vpY", vpY);
   r.setFloat("extrudeDepth", extrudeDepth); r.setFloat("extrudeShade", extrudeShade);
+  r.setBoolean("morph", morphActive);    r.setFloat("morphT", morphT);   r.setInt("morphGen", morphGen);
+  r.setFloat("morphSpread", morphSpread);
   r.setBoolean("imageMode", imageMode);
   if (imagePath != null) r.setString("img", imagePath);
   r.setInt("imgCols", imgCols);          r.setInt("imgLib", libSize);
@@ -1678,12 +1762,22 @@ boolean loadManifest(String path) {
     lineSubdivProb = r.getFloat("lineSubdiv", lineSubdivProb);
     kumikoStyle    = r.getBoolean("kumiko", kumikoStyle);
     stripWidthFrac = r.getFloat("stripWidth", stripWidthFrac);
+    metalMode      = r.getBoolean("metal", metalMode);
+    metalMaterial  = r.getInt("metalMat", metalMaterial);
+    metalBevelStyle = r.getInt("metalStyle", metalBevelStyle);
+    metalBevelPx   = r.getFloat("metalBevel", metalBevelPx);
+    metalLightDeg  = r.getFloat("metalLight", metalLightDeg);
     extrude3D      = r.getBoolean("extrude", extrude3D);
     extrudeMode    = r.getInt("extrudeMode", extrudeMode);
     vpX            = r.getFloat("vpX", vpX);
     vpY            = r.getFloat("vpY", vpY);
     extrudeDepth   = r.getFloat("extrudeDepth", extrudeDepth);
     extrudeShade   = r.getFloat("extrudeShade", extrudeShade);
+    morphActive    = r.getBoolean("morph", morphActive);
+    morphT         = r.getFloat("morphT", morphT);
+    morphGen       = r.getInt("morphGen", morphGen);
+    morphSpread    = r.getFloat("morphSpread", morphSpread);
+    if (morphActive) headlessMorph = true;    // a loaded morph frame is a pinned phase
     imageMode      = r.getBoolean("imageMode", imageMode);
     if (r.hasKey("img")) imagePath = r.getString("img");
     imgCols        = r.getInt("imgCols", imgCols);
@@ -1814,6 +1908,12 @@ void keyPressed() {
   } else if (key == 'a' || key == 'A') {   // toggle animation
     setAnimEnabled(!animEnabled);
     println("animation: " + animEnabled);
+  } else if (key == 'o') {                 // one-shot tile morph to a fresh motif set
+    startMorph();
+    println("morph");
+  } else if (key == 'O') {                 // staggered morph (tiles finish at different times)
+    startMorphStaggered();
+    println("morph (staggered)");
   } else if (key == 'p') {                 // next palette
     palettes.next();
     duoRandom = false;                     // new palette -> back to duotone extremes

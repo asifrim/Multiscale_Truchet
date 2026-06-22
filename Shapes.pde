@@ -58,6 +58,14 @@ class Tile {
   int n, depth;
   int mi = 0, mk = 0;     // motif: index into connsFor(n) + rotation steps; set in
                           // collectTile so a symmetry twin can reuse its source's motif
+  // One-shot morph (see startMorph): the TARGET motif this tile is cross-dissolving
+  // toward. Rolled in rollMorphTargets; mi/mk become miTo/mkTo at commitMorph. When
+  // no morph is active (or mi==miTo && mk==mkTo) the render path is byte-identical.
+  int miTo = 0, mkTo = 0;
+  float morphOff = 0;         // staggered morph: this tile's start offset in [0, morphSpread]
+                              // so tiles begin/finish at slightly different times (0 = in sync)
+  boolean straddle = false;   // sits on a structural-symmetry axis (its own mirror) ->
+                              // its morph target must be axis-symmetric (rollSymmetricTarget)
   boolean flip = false;   // mirror twin: reverse the vertex winding (see TileGeom),
                           // which draws the exact mirror image of the motif
   // --- trapezoid tiles (shapeMode 3) ---------------------------------------
@@ -356,6 +364,14 @@ ArrayList<Tile> children(Tile t) {
 class TileGeom {
   boolean trap;
   int n; int[][] conns;
+  // Morph (one-shot motif cross-dissolve): when non-null, conns is the UNION of the
+  // from + to motifs and these give each conn's reveal fraction (1 = full) and the
+  // end it grows from. null => no morph for this tile => byte-identical render path.
+  float[] connFrac = null;
+  int[]   connGrowEnd = null;
+  // Per union-conn: the motif it belongs to (mi, mk) + its index within that motif's
+  // alphabet -> a stable line-subdiv coin that doesn't flip when the morph commits.
+  int[]   connOwnMi = null, connOwnMk = null, connOwnCi = null;
   float[] vx, vy, mx, my;          // polygon vertices + edge midpoints (regular)
   float[] bgWx, bgWy, fgWx, fgWy;  // wing-disc centres (bg corners / fg ports)
   boolean wings;
@@ -383,6 +399,15 @@ class TileGeom {
     int[][][] alpha = connsFor(n);
     if (alpha == null) { dbg("NULL", "connsFor(" + n + ") null at k=" + anchorsPerSide + " mi=" + t.mi); alpha = BLANK_CONNS; }
     conns = (t.mi >= 0 && t.mi < alpha.length) ? alpha[t.mi] : new int[0][];   // mi = -1 -> blank tile
+    // one-shot morph: replace conns with the from+to union (+ per-conn fractions).
+    if (morphActive && (t.mi != t.miTo || t.mk != t.mkTo)) {
+      int[][] fromC = conns;
+      int[][] toRaw = (t.miTo >= 0 && t.miTo < alpha.length) ? alpha[t.miTo] : new int[0][];
+      int ds = t.mkTo - t.mk;
+      int[][] toC = new int[toRaw.length][];
+      for (int i = 0; i < toRaw.length; i++) toC[i] = rotConn(toRaw[i], ds, n, anchors);
+      applyMorphUnion(t, fromC, toC, morphLocalMix(t));
+    }
     // flip = mirror twin: wind the vertices the other way (and negate the motif
     // rotation), which renders the exact mirror image of the source's motif --
     // edge k of the flipped tile is the reflection of edge k of the source, so
@@ -447,6 +472,10 @@ class TileGeom {
   // similarity (p0', e') with e' = e*e^{i*theta} and p0' = p0 + Cc*e - Cc*e'.
   void initTrap(Tile t) {
     conns = (t.mi >= 0 && t.mi < TRAP_CONNS.length) ? TRAP_CONNS[t.mi] : new int[0][];   // mi = -1 -> blank
+    if (morphActive && t.mi != t.miTo) {   // trapezoid morph (mk always 0, no relabel)
+      int[][] toC = (t.miTo >= 0 && t.miTo < TRAP_CONNS.length) ? TRAP_CONNS[t.miTo] : new int[0][];
+      applyMorphUnion(t, conns, toC, morphLocalMix(t));
+    }
     anchors = 1; wholeHex = false;       // trapezoid keeps its bespoke 5-port geometry
     float th = animRotOffset;                 // 0 when animation is off -> identity
     float c = cos(th), s = sin(th);
@@ -486,30 +515,135 @@ class TileGeom {
   boolean thinMotif(int code) { return isInlineComp(code) || isPointGlyph(code); }
   boolean hasThinMotif() { for (int[] cn : conns) if (thinMotif(cn[0])) return true; return false; }
   float motifStrokeW()   { return max(0.75, side / (10.0 * anchors) * animBandScale); }
+  // ---- one-shot morph -----------------------------------------------
+  // Build the from+to union conn list with a reveal fraction per connection:
+  //  persistent (in both) -> 1, departing (from-only) -> 1-mix, arriving (to-only)
+  //  -> mix, where mix = smoothstep(morphT). `to` is already relabelled into this
+  //  geom's (mk) frame. Sets conns / connFrac / connGrowEnd.
+  void applyMorphUnion(Tile t, int[][] fromC, int[][] toC, float mix) {
+    ArrayList<int[]> uc = new ArrayList<int[]>();
+    ArrayList<Float> uf = new ArrayList<Float>();
+    ArrayList<int[]> own = new ArrayList<int[]>();    // {mi, mk, ci} of the owning motif
+    for (int ciF = 0; ciF < fromC.length; ciF++) {
+      int ciT = indexOfConn(toC, fromC[ciF]);
+      uc.add(fromC[ciF]);
+      if (ciT >= 0) { uf.add(1.0);       own.add(new int[]{ t.miTo, t.mkTo, ciT }); }  // persistent -> target identity
+      else          { uf.add(1.0 - mix); own.add(new int[]{ t.mi,   t.mk,   ciF }); }  // departing  -> source identity
+    }
+    for (int ciT = 0; ciT < toC.length; ciT++)
+      if (indexOfConn(fromC, toC[ciT]) < 0) { uc.add(toC[ciT]); uf.add(mix); own.add(new int[]{ t.miTo, t.mkTo, ciT }); }  // arriving -> target
+    conns = uc.toArray(new int[0][]);
+    connFrac = new float[uf.size()];
+    connOwnMi = new int[uf.size()]; connOwnMk = new int[uf.size()]; connOwnCi = new int[uf.size()];
+    for (int i = 0; i < uf.size(); i++) {
+      connFrac[i] = uf.get(i);
+      connOwnMi[i] = own.get(i)[0]; connOwnMk[i] = own.get(i)[1]; connOwnCi[i] = own.get(i)[2];
+    }
+    // grow from the end held by a persistent (frac==1) conn, so a new band emerges
+    // from surviving structure; departing bands retract toward that same end.
+    java.util.HashSet<Integer> anchored = new java.util.HashSet<Integer>();
+    for (int i = 0; i < conns.length; i++)
+      if (connFrac[i] >= 1 && conns[i][0] < CONN_TAG) { anchored.add(conns[i][0]); anchored.add(conns[i][1]); }
+    connGrowEnd = new int[conns.length];
+    for (int i = 0; i < conns.length; i++) {
+      int[] c = conns[i];
+      if (c[0] < CONN_TAG && anchored.contains(c[1]) && !anchored.contains(c[0])) connGrowEnd[i] = 1;
+    }
+  }
+  // Canonical key for set membership: tagged primitives by code + sorted ports,
+  // plain pairs by sorted ports + the straight flag (an arc and a straight band
+  // between the same ports are different connections).
+  String connKey(int[] c) {
+    if (c[0] >= CONN_TAG) {
+      int[] ps = new int[c.length - 1];
+      for (int i = 1; i < c.length; i++) ps[i - 1] = c[i];
+      java.util.Arrays.sort(ps);
+      StringBuilder sb = new StringBuilder("T" + c[0]);
+      for (int p : ps) sb.append('_').append(p);
+      return sb.toString();
+    }
+    int lo = min(c[0], c[1]), hi = max(c[0], c[1]);
+    boolean straight = (c.length >= 3 && c[2] == 1);
+    return "P" + lo + "_" + hi + (straight ? "s" : "");
+  }
+  boolean containsConn(int[][] list, int[] c) { return indexOfConn(list, c) >= 0; }
+  int indexOfConn(int[][] list, int[] c) {
+    String k = connKey(c);
+    for (int i = 0; i < list.length; i++) if (connKey(list[i]).equals(k)) return i;
+    return -1;
+  }
+
+  // Line-mode per-stroke subdiv state for connection ci. Non-morph -> the plain
+  // tile/ci hash (byte-identical). Morphing -> keyed on the connection's OWNING motif
+  // so it stays consistent through the morph + commit (no thin<->thick flip).
+  boolean subdivided(Tile t, int ci) {
+    if (connOwnMi == null) return strokeSubdivided(t, ci);
+    return strokeSubdividedHash(t, connOwnMi[ci], connOwnMk[ci], connOwnCi[ci]);
+  }
+
   // Split append (offset 0): regular bands -> `bands`, thin circuit motifs -> `thin`.
   void appendBandsSplit(Path2D.Float bands, Path2D.Float thin) {
     if (trap) { appendBands(bands); return; }            // trapezoid has no circuit motifs
-    for (int[] cn : conns) appendMotifConn(thinMotif(cn[0]) ? thin : bands, cn, 0);
+    for (int ci = 0; ci < conns.length; ci++)
+      appendMotifConnF(thinMotif(conns[ci][0]) ? thin : bands, ci, 0);
   }
 
   // Append every connection's centre-line, displaced by a constant PERPENDICULAR
   // `offset` (px) -- offset 0 is the centre-line (the solid-band path); line mode
   // calls this once per line in the bundle (see lineOffsets / drawTileBands).
   void appendBandsOffset(Path2D.Float path, float offset) {
-    if (trap) {
-      for (int[] cn : conns) appendTrapConn(path, cn[0], cn[1], offset);
-    } else {
-      for (int[] cn : conns) appendMotifConn(path, cn, offset);
-    }
+    for (int ci = 0; ci < conns.length; ci++) appendOneBand(path, ci, offset);
   }
 
   // Append a SINGLE connection's centre-line (displaced by `offset`) -- line mode
   // decides per stroke whether to subdivide it into a bundle or draw it full
   // thickness (see drawTileLineBundle / lineSubdivProb), so it appends one at a time.
   void appendOneBand(Path2D.Float path, int ci, float offset) {
+    if (trap) appendTrapConnF(path, ci, offset);
+    else      appendMotifConnF(path, ci, offset);
+  }
+
+  // Append connection ci, truncated to its morph reveal fraction (1 = full = the
+  // original verbatim path, so a non-morphing tile is byte-identical).
+  void appendMotifConnF(Path2D.Float path, int ci, float offset) {
+    float f = (connFrac == null) ? 1 : connFrac[ci];
+    if (f >= 1) { appendMotifConn(path, conns[ci], offset); return; }
+    if (f <= 0) return;
+    Path2D.Float scratch = new Path2D.Float();
+    appendMotifConn(scratch, conns[ci], offset);
+    appendTruncated(path, scratch, f, connGrowEnd[ci]);
+  }
+  void appendTrapConnF(Path2D.Float path, int ci, float offset) {
     int[] cn = conns[ci];
-    if (trap) appendTrapConn(path, cn[0], cn[1], offset);
-    else      appendMotifConn(path, cn, offset);
+    float f = (connFrac == null) ? 1 : connFrac[ci];
+    if (f >= 1) { appendTrapConn(path, cn[0], cn[1], offset); return; }
+    if (f <= 0) return;
+    Path2D.Float scratch = new Path2D.Float();
+    appendTrapConn(scratch, cn[0], cn[1], offset);
+    appendTruncated(path, scratch, f, connGrowEnd[ci]);
+  }
+
+  // Pulse path-tracing: the centre-line of connection ci as a flat polyline
+  // [x0,y0,x1,y1,...] (offset 0), or null if it's not a traceable "wire". Wires =
+  // plain pairs / straight / hump / inline components (the comet rides the chord of
+  // a component, not its zigzag); EXCLUDE dots/rings/terminals/glyphs (decorative
+  // marks, no through-conduit). Endpoints equal portXY(pa)/portXY(pb) by
+  // construction, so abutting tiles' segments share exact coordinates -> linkable.
+  float[] sampleBand(int ci) {
+    int[] cn = conns[ci];
+    if (!trap) {
+      int code = cn[0];
+      if (code == CONN_DOT || code == CONN_CIRCLE || isPointGlyph(code)) return null;
+      if (isInlineComp(code)) {                       // ride the straight chord A->B
+        float[] A = portXY(cn[1]), B = portXY(cn[2]);
+        return new float[]{ A[0], A[1], B[0], B[1] };
+      }
+      // CONN_HUB is a multi-spoke junction (degree>2); skip as a single segment.
+      if (code == CONN_HUB) return null;
+    }
+    Path2D.Float p = new Path2D.Float();
+    appendOneBand(p, ci, 0);
+    return pathToPolyline(p);
   }
 
   // Dispatch one (non-trapezoid) connection: a tagged primitive (hub/hump, see
@@ -553,10 +687,15 @@ class TileGeom {
   boolean isInteriorPort(int p) { return p >= n * anchors; }
   // Centres of any solid-point (CONN_DOT) motifs -- filled discs (radius side/(6k))
   // drawn by the fill passes (foreground / shadow / extrude), like wing nubs.
+  // {x, y, frac} per CONN_DOT (frac = morph reveal, 1 when not morphing). The fill
+  // passes scale the disc radius by frac so a dot grows/shrinks with the morph.
   ArrayList<float[]> dotXY() {
     ArrayList<float[]> out = new ArrayList<float[]>();
     if (trap) return out;
-    for (int[] cn : conns) if (cn[0] == CONN_DOT) out.add(portXY(cn[1]));
+    for (int ci = 0; ci < conns.length; ci++) if (conns[ci][0] == CONN_DOT) {
+      float[] c = portXY(conns[ci][1]);
+      out.add(new float[]{ c[0], c[1], (connFrac == null) ? 1 : connFrac[ci] });
+    }
     return out;
   }
   // Screen position of port p: edge anchors (fgWx), then apothem midpoints (centre
@@ -773,10 +912,12 @@ void drawTileForeground(Tile t, color fg) {
   ArrayList<float[]> dots = gm.dotXY();
   if (!dots.isEmpty()) {
     noStroke();
-    float r = gm.fgR0 * animDiscScale, dd = 2 * r;
+    float r0 = gm.fgR0 * animDiscScale;
     for (float[] p : dots) {
+      float r = r0 * p[2];                              // morph: scale radius by reveal frac
+      if (r <= 0) continue;
       if (gradientStroke()) fillDiscG2(p[0], p[1], r);
-      else { fill(fg); ellipse(p[0], p[1], dd, dd); }
+      else { fill(fg); ellipse(p[0], p[1], 2 * r, 2 * r); }
     }
   }
 }
@@ -825,7 +966,7 @@ void drawTileLineRings(Tile t, color fg) {
 boolean[] solidPorts(TileGeom gm, Tile t) {
   boolean[] sp = new boolean[gm.fgWx.length];
   for (int ci = 0; ci < gm.conns.length; ci++)
-    if (!strokeSubdivided(t, ci)) {
+    if (!gm.subdivided(t, ci)) {
       int[] cn = gm.conns[ci];
       if (cn[0] < sp.length) sp[cn[0]] = true;
       if (cn[1] < sp.length) sp[cn[1]] = true;
@@ -867,7 +1008,7 @@ void drawTileLineBundle(Tile t, color fg) {
   TileGeom gm = new TileGeom(t);
   if (gm.wholeHex && colorScheme != 2) {
     for (int ci = 0; ci < gm.conns.length; ci++)
-      if (strokeSubdivided(t, ci))
+      if (gm.subdivided(t, ci))
         for (float off : lineOffsets(lineBundleW(gm))) gm.appendOneBand(hexBatch, ci, off);
       else
         gm.appendOneBand(hexSolidBatch, ci, 0);
@@ -881,7 +1022,7 @@ void drawTileLineBundle(Tile t, color fg) {
   Path2D.Float lines = new Path2D.Float();   // subdivided strokes
   Path2D.Float solid = new Path2D.Float();   // full-thickness strokes
   for (int ci = 0; ci < gm.conns.length; ci++) {
-    if (strokeSubdivided(t, ci))
+    if (gm.subdivided(t, ci))
       for (float off : lineOffsets(lineBundleW(gm))) gm.appendOneBand(lines, ci, off);
     else
       gm.appendOneBand(solid, ci, 0);
@@ -893,8 +1034,8 @@ void drawTileLineBundle(Tile t, color fg) {
   g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
   g2.draw(lines);
   // solid points: filled discs on top (paint already fg)
-  float dr = gm.fgR0 * animDiscScale;
-  for (float[] p : gm.dotXY()) g2.fill(new Ellipse2D.Float(p[0] - dr, p[1] - dr, 2 * dr, 2 * dr));
+  float dr0 = gm.fgR0 * animDiscScale;
+  for (float[] p : gm.dotXY()) { float dr = dr0 * p[2]; if (dr > 0) g2.fill(new Ellipse2D.Float(p[0] - dr, p[1] - dr, 2 * dr, 2 * dr)); }
 }
 
 // Stable per-stroke (tile + connection) coin flip: true => subdivide into the
@@ -902,14 +1043,20 @@ void drawTileLineBundle(Tile t, color fg) {
 // hash of the tile's identity (so it's fixed per seed and doesn't reshuffle each
 // frame or when the slider moves), thresholded by lineSubdivProb. The endpoints
 // short-circuit so prob 1 is byte-identical to plain line mode.
-boolean strokeSubdivided(Tile t, int ci) {
+boolean strokeSubdivided(Tile t, int ci) { return strokeSubdividedHash(t, t.mi, t.mk, ci); }
+// The coin is keyed on the OWNING motif (mi, mk) + the connection's index WITHIN that
+// motif. Non-morph passes the tile's own (mi, mk, ci) -> byte-identical to before. A
+// morphing tile passes the identity of the motif each connection belongs to (target
+// for surviving/arriving conns, source for departing) so the subdiv state is the SAME
+// before, during, and after the morph -- no thin<->thick flip when the morph commits.
+boolean strokeSubdividedHash(Tile t, int mi, int mk, int ci) {
   if (lineSubdivProb >= 1.0) return true;
   if (lineSubdivProb <= 0.0) return false;
   int h = Float.floatToIntBits(t.cx);
   h = h * 31 + Float.floatToIntBits(t.cy);
   h = h * 31 + t.depth;
-  h = h * 31 + t.mi;
-  h = h * 31 + t.mk;
+  h = h * 31 + mi;
+  h = h * 31 + mk;
   h = h * 31 + ci;
   h ^= (h >>> 16); h *= 0x7feb352d; h ^= (h >>> 15); h *= 0x846ca68b; h ^= (h >>> 16);
   return (h & 0x7fffffff) / 2147483647.0 < lineSubdivProb;
@@ -961,8 +1108,10 @@ void addTileShadow(Graphics2D sg, Tile t) {
   if (gm.wings)                               // the fg nubs cast shadows too
     for (int k = 0; k < gm.fgWx.length; k++)
       sg.fill(new Ellipse2D.Float(gm.fgWx[k] - r, gm.fgWy[k] - r, 2 * r, 2 * r));
-  for (float[] p : gm.dotXY())                // solid points cast shadows too
-    sg.fill(new Ellipse2D.Float(p[0] - r, p[1] - r, 2 * r, 2 * r));
+  for (float[] p : gm.dotXY()) {              // solid points cast shadows too
+    float rd = r * p[2];                       // morph: scale by reveal frac
+    if (rd > 0) sg.fill(new Ellipse2D.Float(p[0] - rd, p[1] - rd, 2 * rd, 2 * rd));
+  }
   sg.setTransform(oldT);
 }
 
@@ -1010,7 +1159,7 @@ void drawExtrudeLevel(int d) {
     float r = gm.fgR0 * animDiscScale;
     if (gm.wings)                               // whole-hex tiles have no nubs
       for (int k = 0; k < gm.fgWx.length; k++) nubs.add(new float[]{ gm.fgWx[k], gm.fgWy[k], r });
-    for (float[] p : gm.dotXY()) nubs.add(new float[]{ p[0], p[1], r });   // solid points extrude too
+    for (float[] p : gm.dotXY()) { float rd = r * p[2]; if (rd > 0) nubs.add(new float[]{ p[0], p[1], rd }); }   // solid points extrude too (morph-scaled)
     repSide = gm.side; repBandW = gm.bandW; repWholeHex = gm.wholeHex; any = true;
   }
   if (!any) return;
@@ -1321,6 +1470,78 @@ void appendCircle(Path2D.Float path, float cx, float cy, float r, float offset) 
     if (q == 0) path.moveTo(px, py); else path.lineTo(px, py);
   }
   path.closePath();
+}
+
+// ---- morph helpers ------------------------------------------------
+// Relabel a connection's ports by `ds` edge-steps, so a TO motif (authored in its
+// own mk frame) is expressed in the FROM tile's mk frame for the union/diff. Every
+// port slot of every conn shape (plain pair, hub, hump, component, single-port
+// primitive) is shifted; the trailing straight flag stays.
+int[] rotConn(int[] c, int ds, int n, int k) {
+  if (ds == 0) return c;
+  int[] r = c.clone();
+  if (c[0] >= CONN_TAG) {
+    if (c[0] == CONN_HUB) { for (int i = 1; i < c.length; i++) r[i] = rotPortFull(c[i], ds, n, k); }
+    else if (c[0] == CONN_HUMP || isInlineComp(c[0])) { r[1] = rotPortFull(c[1], ds, n, k); r[2] = rotPortFull(c[2], ds, n, k); }
+    else { r[1] = rotPortFull(c[1], ds, n, k); }   // single-port: circle/dot/term/ground/arrow/cross
+  } else {
+    r[0] = rotPortFull(c[0], ds, n, k);
+    r[1] = rotPortFull(c[1], ds, n, k);
+  }
+  return r;
+}
+// rotPort extended to vertex (corner / Kumiko) ports, which a plain rotPort leaves
+// fixed. Edge anchors + apothem mids spin via rotPort; the centre is fixed; a vertex
+// follows its corner under the rotation.
+int rotPortFull(int p, int ds, int n, int k) {
+  int E = n * k;
+  int m = ((ds % n) + n) % n;
+  if (p < E + n) return rotPort(p, m, n, k);     // edge anchors + apothem midpoints
+  if (p == E + n) return p;                       // centre (fixed)
+  int v = p - (E + n + 1); return E + n + 1 + ((v + m) % n);   // vertex (corner)
+}
+
+// Append `src` to `dst`, but with each subpath truncated to a leading `frac`
+// (0<frac<1) of its own arc-length -- a connection growing along its path. growEnd
+// 0 grows from the subpath start, 1 from its end (so a band grows from its anchored
+// port). frac>=1 is handled by the caller (verbatim, byte-identical).
+void appendTruncated(Path2D.Float dst, Path2D.Float src, float frac, int growEnd) {
+  java.awt.geom.PathIterator it = src.getPathIterator(null);
+  float[] co = new float[6];
+  ArrayList<float[]> sub = new ArrayList<float[]>();
+  while (!it.isDone()) {
+    int type = it.currentSegment(co);
+    if (type == java.awt.geom.PathIterator.SEG_MOVETO) {
+      if (!sub.isEmpty()) { emitTrunc(dst, sub, frac, growEnd); sub = new ArrayList<float[]>(); }
+      sub.add(new float[]{ co[0], co[1] });
+    } else if (type == java.awt.geom.PathIterator.SEG_LINETO) {
+      sub.add(new float[]{ co[0], co[1] });
+    }
+    // SEG_CLOSE: the closing edge is already represented (appendCircle repeats the
+    // first point at q==seg), so a truncated ring is just a leading open arc.
+    it.next();
+  }
+  if (!sub.isEmpty()) emitTrunc(dst, sub, frac, growEnd);
+}
+void emitTrunc(Path2D.Float dst, ArrayList<float[]> pts, float frac, int growEnd) {
+  int m = pts.size();
+  if (m < 2) return;
+  if (growEnd == 1) java.util.Collections.reverse(pts);
+  float total = 0;
+  for (int i = 1; i < m; i++) total += dist(pts.get(i-1)[0], pts.get(i-1)[1], pts.get(i)[0], pts.get(i)[1]);
+  float target = total * frac;
+  dst.moveTo(pts.get(0)[0], pts.get(0)[1]);
+  float acc = 0;
+  for (int i = 1; i < m; i++) {
+    float[] a = pts.get(i-1), b = pts.get(i);
+    float seg = dist(a[0], a[1], b[0], b[1]);
+    if (acc + seg >= target) {
+      float u = (target - acc) / max(1e-6, seg);
+      dst.lineTo(a[0] + (b[0]-a[0]) * u, a[1] + (b[1]-a[1]) * u);
+      return;
+    }
+    dst.lineTo(b[0], b[1]); acc += seg;
+  }
 }
 
 // cubic Bezier value + derivative at u (for multi-anchor connections).
