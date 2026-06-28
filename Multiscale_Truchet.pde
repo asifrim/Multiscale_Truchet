@@ -62,13 +62,13 @@
 // Edges, clockwise:  0 = N (top), 1 = E (right), 2 = S (bottom), 3 = W (left)
 
 // ---- parameters -------------------------------------------------
-int     gridN         = 6;      // top-level cells per side
-int     maxDepth      = 4;      // max recursive subdivisions
-float   subdivideProb = 0.55;   // chance a cell splits into 4
+int     gridN         = 9;      // top-level cells per side
+int     maxDepth      = 3;      // max recursive subdivisions
+float   subdivideProb = 0.2;    // chance a cell splits into 4
 int     seedVal       = 1;
 boolean winged        = true;   // Carlson wings (structural connections)
 boolean invertPerLevel= true;   // (duotone scheme) flip colours each scale level
-boolean dropShadow    = true;   // bands + wing nubs cast a drop shadow
+boolean dropShadow    = false;  // bands + wing nubs cast a drop shadow
 float   shadowAngle   = QUARTER_PI;  // direction the shadow falls (radians, screen coords)
 float   shadowSize    = 0.4;    // shadow offset as a fraction of the band stroke width (side/3)
 float   shadowStrength= 0.3;    // shadow darkness: 0 = invisible, 1 = black
@@ -141,8 +141,59 @@ float[] libBright;             // per-patch measured mean luminance (0..255), pa
 // gradient scheme state (recomputed per draw; see setupGradient)
 color   gradSolid;              // the one solid colour (tile background)
 color[] gradStops;              // the other colours, forming the band gradient
-float   gradCos, gradSin, gradMin, gradSpan;   // gradient axis + projection range
-LinearGradientPaint gradPaint;  // Java2D paint matching the gradient (smooth schemes)
+float   gradCos, gradSin, gradMin, gradSpan;   // gradient axis + projection range (linear)
+java.awt.Paint gradPaint;       // Java2D paint matching the gradient (smooth schemes)
+
+// Radial transient: instead of the default unidirectional LINEAR gradient (project
+// onto an axis), measure distance from a centre point so colour radiates outward in
+// rings. Applies to the whole gradient family (schemes 2-6, including the animated
+// wheel -> expanding/contracting rings). gradCx/gradCy are the centre in normalised
+// canvas coords (0..1), adjustable live. The gradient parameter t in [0,1] is the
+// shared seam between gradientColor() (per-point) and the Java2D paints.
+boolean gradRadial = false;     // false = linear (default), true = radial
+float   gradCx = 0.5, gradCy = 0.5;   // radial centre (normalised canvas coords)
+// Radius so t spans 0 (centre) .. 1 (furthest canvas corner), covering the canvas.
+float gradRadius() {
+  float cx = gradCx * width, cy = gradCy * height, r = 1;
+  float[] xs = { 0, width, 0, width }, ys = { 0, 0, height, height };
+  for (int i = 0; i < 4; i++) r = max(r, dist(cx, cy, xs[i], ys[i]));
+  return r;
+}
+// The gradient parameter t at a point: radial distance (normalised) or linear axis
+// projection. Both gradientColor() and wheelColorAt() build their t from this, so a
+// point's colour and the Java2D paint stay consistent.
+float gradParam(float x, float y) {
+  if (gradRadial) return dist(x, y, gradCx * width, gradCy * height) / gradRadius();
+  return (x * gradCos + y * gradSin - gradMin) / gradSpan;
+}
+
+// gradient-wheel scheme (5): the WHOLE palette arranged as a cyclic 360 deg wheel
+// (last stop wraps to the first, no seam), whose phase animates so the background
+// gradient continuously transitions through the palette. wheelRate is the
+// controllable rate (wheel turns per second); wheelPhase is the live 0..1 offset.
+float   wheelRate  = 0.15;      // wheel rotations per second (Controls "wheel rate")
+float   wheelPhase = 0;         // current animated phase in [0,1)
+boolean headlessWheel = false;  // TRUCHET_WHEEL_PHASE pins the phase (no advance)
+Color[] wheelCols;              // cyclic stop colours (c0..c(n-1), c0) for the Java2D paint
+float[] wheelFr;                // matching even fractions [0 .. 1]
+java.awt.Paint wheelFgPaint;    // per-frame foreground wheel paint (schemes 5/6); see fgPaint()
+// Cached cyclic colour LUT for the radial wheel (RadialWheelPaint). Built once per
+// setupGradient (depends only on the palette), NOT per draw primitive -- Java2D calls
+// Paint.createContext once per fill/stroke, and the foreground draws thousands of them
+// (each tile's bands + every wing nub/disc), so rebuilding the LUT each time was the
+// real cost. Phase is applied as a continuous index offset, so one LUT serves every
+// phase + both bg/fg. Power-of-two size -> the per-pixel index uses a mask.
+final int WHEEL_LUT_N = 2048;
+int[] wheelLUT;
+
+// Schemes whose BACKGROUND is the smooth gradient (ribbons solid, bg polygon
+// skipped, wing corner discs sample the gradient): gradient-bg (3) + the animated
+// gradient-wheel (5). Schemes 4 + 6 paint the RIBBONS with the gradient instead.
+boolean schemeBgGradient() { return colorScheme == 3 || colorScheme == 5; }
+// Schemes whose FOREGROUND ribbons are painted with the animated cyclic wheel:
+// gradient-wheel (5, ribbons ride a half-turn ahead of the bg wheel) + the
+// fg-only gradient-wheel-fg (6, solid bg). Both share the per-frame wheelFgPaint.
+boolean schemeWheelFg() { return colorScheme == 5 || colorScheme == 6; }
 
 PaletteManager palettes;        // colour source (see Palettes.pde), set in setup()
 ControlWindow  controls;        // unified GUI window (params + tile pane; see ControlWindow.pde), set in setup()
@@ -569,7 +620,13 @@ void settings() {
     w = round(w * s); h = round(h * s);
   }
   size(w, h);
-  smooth(8);
+  // Antialiasing level. Defaults to 8 (byte-identical to before); TRUCHET_SMOOTH lets
+  // a live animation trade AA quality for fill rate (e.g. 2/4 while animating, 8 for a
+  // print/export). smooth() must live in settings() and can't change after setup.
+  int sm = 8;
+  String envSm = System.getenv("TRUCHET_SMOOTH");
+  if (envSm != null) { try { sm = Integer.parseInt(envSm.trim()); } catch (NumberFormatException e) { } }
+  if (sm <= 1) noSmooth(); else smooth(sm);
 }
 
 void setup() {
@@ -600,8 +657,22 @@ void setup() {
   if (envLoad != null) loadManifest(envLoad.trim());
   String envShape  = System.getenv("TRUCHET_SHAPE");   // 0 square, 1 triangle, 2 hexagon, 3 trapezoid
   if (envShape != null)  shapeMode   = constrain(Integer.parseInt(envShape.trim()), 0, 3);
-  String envScheme = System.getenv("TRUCHET_SCHEME");  // 0..4, see schemeName()
-  if (envScheme != null) colorScheme = constrain(Integer.parseInt(envScheme.trim()), 0, 4);
+  String envScheme = System.getenv("TRUCHET_SCHEME");  // 0..6, see schemeName()
+  if (envScheme != null) colorScheme = constrain(Integer.parseInt(envScheme.trim()), 0, 6);
+  String envWRate = System.getenv("TRUCHET_WHEEL_RATE");  // gradient-wheel turns per second
+  if (envWRate != null) wheelRate = Float.parseFloat(envWRate.trim());
+  String envWPh = System.getenv("TRUCHET_WHEEL_PHASE");   // pin the wheel phase 0..1 (headless, no advance)
+  if (envWPh != null) { wheelPhase = Float.parseFloat(envWPh.trim()); wheelPhase -= floor(wheelPhase); headlessWheel = true; }
+  String envGRad = System.getenv("TRUCHET_GRAD_RADIAL");  // 0/1: radial vs linear gradient transient
+  if (envGRad != null && !envGRad.trim().equals("0")) gradRadial = true;
+  String envGCx = System.getenv("TRUCHET_GRAD_CX");       // radial centre x (normalised 0..1)
+  if (envGCx != null) gradCx = Float.parseFloat(envGCx.trim());
+  String envGCy = System.getenv("TRUCHET_GRAD_CY");       // radial centre y (normalised 0..1)
+  if (envGCy != null) gradCy = Float.parseFloat(envGCy.trim());
+  // A headless render is a single frame: freeze the wheel so the saved phase (env,
+  // manifest, or default 0) is exactly what renders -- so a manifest reproduces
+  // byte-identically instead of advancing one step before the save.
+  if (autosavePath != null) headlessWheel = true;
   String envSeed   = System.getenv("TRUCHET_SEED");
   if (envSeed != null)   seedVal     = Integer.parseInt(envSeed.trim());
   String envPal    = System.getenv("TRUCHET_PALETTE"); // palette index (wraps; see loadDefaults)
@@ -710,14 +781,30 @@ void setup() {
   // --- one-shot tile morph (headless: pin a single mid-morph frame) ---
   String envMorph = System.getenv("TRUCHET_MORPH");        // 0/1 enable
   if (envMorph != null && !envMorph.trim().equals("0")) { morphActive = true; headlessMorph = true; }
-  String envMDur = System.getenv("TRUCHET_MORPH_DUR");     // seconds (GUI playback)
-  if (envMDur != null) morphDurationSec = max(0.05, Float.parseFloat(envMDur.trim()));
+  String envMDur = System.getenv("TRUCHET_MORPH_DUR");     // seconds; sets EVERY level
+  if (envMDur != null) { float v = max(0.05, Float.parseFloat(envMDur.trim())); for (int i = 0; i < MAX_MORPH_LV; i++) morphDurLevel[i] = v; }
+  String envMDL = System.getenv("TRUCHET_MORPH_DUR_LEVELS"); // per-level: "1.5,1.0,0.6,..." (depth 0..)
+  if (envMDL != null) {
+    String[] parts = split(envMDL.trim(), ',');
+    for (int i = 0; i < parts.length && i < MAX_MORPH_LV; i++)
+      if (parts[i].trim().length() > 0) morphDurLevel[i] = max(0.05, Float.parseFloat(parts[i].trim()));
+  }
   String envMT = System.getenv("TRUCHET_MORPH_T");         // pin the morph phase 0..1
   if (envMT != null) { morphT = constrain(Float.parseFloat(envMT.trim()), 0, 1); morphActive = true; headlessMorph = true; }
   String envMGen = System.getenv("TRUCHET_MORPH_GEN");     // which target roll (default 0)
   if (envMGen != null) morphGen = Integer.parseInt(envMGen.trim());
   String envMSpr = System.getenv("TRUCHET_MORPH_SPREAD");  // 0 in-sync, >0 staggered start/finish
   if (envMSpr != null) morphSpread = constrain(Float.parseFloat(envMSpr.trim()), 0, 0.9);
+  String envMEase = System.getenv("TRUCHET_MORPH_EASE");   // easing index OR name (see MORPH_EASE_NAMES)
+  if (envMEase != null) morphEasing = parseMorphEase(envMEase.trim());
+  String envMCap = System.getenv("TRUCHET_MORPH_CAP");     // band-cap style index OR name (see MORPH_CAP_NAMES)
+  if (envMCap != null) morphCap = parseMorphCap(envMCap.trim());
+  String envMMode = System.getenv("TRUCHET_MORPH_MODE");   // continuous per-tile random morphing (0/1)
+  if (envMMode != null && !envMMode.trim().equals("0")) morphMode = true;
+  String envMProb = System.getenv("TRUCHET_MORPH_PROB");   // expected morph starts per tile per second
+  if (envMProb != null) morphProb = max(0, Float.parseFloat(envMProb.trim()));
+  String envMFr = System.getenv("TRUCHET_MORPH_FRAMES");   // headless: pre-roll N morph-mode steps before saving
+  if (envMFr != null) headlessMorphFrames = max(0, Integer.parseInt(envMFr.trim()));
 
   // --- image mode (Truchet halftone of a source image) ---
   String envImg = System.getenv("TRUCHET_IMG");          // path -> enable image mode
@@ -755,6 +842,7 @@ void draw() {
   // 0. animation: advance the clock + refresh the modulator snapshot the render
   //    reads (identity when animation is off, so a static frame is unchanged).
   phase("updateAnim");
+  geomStamp++;            // invalidate the per-frame TileGeom cache (see geomFor)
   updateAnim();
 
   // Tiles panel "Reload" button: re-read tiles.json on the viz thread (so the
@@ -772,6 +860,10 @@ void draw() {
   // leaves' target motifs aren't rolled cross-thread mid-render).
   if (morphRequested) { morphRequested = false; logAction("morph start"); startMorph(); }
   if (morphStaggerRequested) { morphStaggerRequested = false; logAction("morph start (staggered)"); startMorphStaggered(); }
+
+  // Controls "morph mode" toggle -> apply on the viz thread (it touches leaves +
+  // the loop state). Done before rebuildLeaves so engaging it can request a build.
+  if (morphModeChanged) { morphModeChanged = false; logAction("morph mode -> " + morphMode); applyMorphModeChange(); }
 
   // gradient + layout are deterministic from seed/params -> rebuild only when a
   // mutator marked them dirty, not every animated frame.
@@ -801,7 +893,7 @@ void draw() {
     drawImageMode();
   } else {
     phase("background");
-    if (colorScheme == 3) drawGradientBackground();   // smooth gradient fills the canvas
+    if (schemeBgGradient()) drawGradientBackground();   // smooth gradient fills the canvas (3 + wheel 5)
     else background(canvasBgColor());
 
     // 1. build the leaf tiling (cached; see rebuildLeaves).
@@ -810,6 +902,16 @@ void draw() {
     // 1b. light-pulse path graph (cached; rebuilt with the layout, or when the
     //     pulse is toggled on at runtime). See Pulse.pde.
     if (dirtyPaths) { phase("rebuildPulsePaths"); rebuildPulsePaths(); dirtyPaths = false; }
+
+    // 1c. continuous morph mode: advance per-tile cross-dissolves + roll new
+    //     triggers, on the now-built/synced leaves (before they render). Headless
+    //     can pre-roll N steps (TRUCHET_MORPH_FRAMES) for a deterministic frame.
+    if (morphMode) {
+      phase("updateMorphMode");
+      int steps = max(1, headlessMorphFrames);
+      for (int i = 0; i < steps; i++) updateMorphMode();
+      headlessMorphFrames = 0;     // pre-roll only once
+    }
 
     // 2. draw the tiling coarse-first (see renderTiling).
     phase("renderTiling");
@@ -848,6 +950,12 @@ void draw() {
     println("reproduce: " + reproduceCmd(saveBaseName()));
     exit();
   }
+  // Authoritative loop control: keep looping while any mode animates (LFO / morph /
+  // gradient-wheel), else settle to static. Placed here so a Controls-thread change
+  // (e.g. selecting the wheel scheme, or moving its rate slider) lands the correct
+  // loop state on the viz thread. Skipped in headless (no window / loop).
+  if (autosavePath == null && panelOutPath == null) refreshLoopState();
+
   phase("(idle)");
  } catch (Throwable e) {
   // The primary crash catch (viz thread). Dump thread + last action + phase + state
@@ -865,6 +973,7 @@ void draw() {
 // between their overlapping bands. Factored out of draw() so image mode can reuse
 // it for both the calibration rounds and the final mosaic.
 void renderTiling() {
+  refreshWheelFgPaint();        // per-frame foreground wheel paint (schemes 5/6); else null
   hexBatch = new Path2D.Float();
   hexSolidBatch = new Path2D.Float();
   hexBatchUsed = false;
@@ -939,7 +1048,7 @@ void renderTiling() {
 //      stays continuous where neighbouring tiles meet.
 // Solid mode and scheme 3 keep the original single per-tile path.
 void drawForegroundLevel(int d) {
-  if (lineMode && colorScheme != 3) {
+  if (lineMode && !schemeBgGradient()) {
     for (Tile lf : leaves) if (lf.depth == d) drawTileLineRings(lf, tileFg(lf));
     for (Tile lf : leaves) if (lf.depth == d) drawTileRibbonBase(lf, tileBg(lf));
     for (Tile lf : leaves) if (lf.depth == d) drawTileLineBundle(lf, tileFg(lf));
@@ -1024,7 +1133,8 @@ void rebuildLeaves() {
   }
   if (rot180)        addRotatedTwins();
   if (vMir || hMir)  addSymTwins(vMir, hMir);
-  if (morphActive)   rollMorphTargets();   // a layout rebuild during a morph re-rolls targets
+  if (morphMode)          syncMorphIdle();      // continuous mode: every fresh tile starts idle
+  else if (morphActive)   rollMorphTargets();   // one-shot: a mid-morph rebuild re-rolls targets
   dirtyPaths = true;     // the light-pulse path graph derives from `leaves`
 }
 
@@ -1376,15 +1486,17 @@ String schemeName(int s) {
     case 1:  return "multi";
     case 2:  return "gradient";
     case 3:  return "gradient-bg";
-    default: return "gradient-smooth";
+    case 4:  return "gradient-smooth";
+    case 5:  return "gradient-wheel";
+    default: return "gradient-wheel-fg";
   }
 }
 
 // Tile background colour.
 color tileBg(Tile t) {
   Palette p = palettes.current();
-  if (colorScheme == 2 || colorScheme == 4) return gradSolid;   // gradient ribbons: solid ground
-  if (colorScheme == 3) return gradientColor(t.cx, t.cy);       // gradient-bg: blend wing corner discs
+  if (colorScheme == 2 || colorScheme == 4 || colorScheme == 6) return gradSolid;  // solid ground (incl. wheel-fg)
+  if (schemeBgGradient()) return gradientColor(t.cx, t.cy);     // gradient-bg / wheel: blend wing corner discs
   if (colorScheme == 1) return p.lightest();                    // multi: constant light ground
   boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: extremes, or 2 random (rotate)
   color a = duoRandom ? p.get(duoBgIdx) : p.lightest();         // bg slot when not inverted
@@ -1392,11 +1504,14 @@ color tileBg(Tile t) {
   return inv ? b : a;
 }
 
-// Foreground (band/wing) colour. (In gradient-smooth the bands are painted via
-// the Java2D gradient instead -- see gradientStroke()/drawTileBands in Shapes.pde.)
+// Foreground (band/wing) colour. In the gradient-smooth + wheel-fg/wheel schemes
+// (4/5/6) the bands are painted via a Java2D gradient instead (gradientStroke()/
+// fgPaint()), so this value is only a per-tile fallback for those.
 color tileFg(Tile t) {
   Palette p = palettes.current();
-  if (colorScheme == 2 || colorScheme == 4) return gradientColor(t.cx, t.cy);  // gradient ribbons
+  if (colorScheme == 2 || colorScheme == 4) return gradientColor(t.cx, t.cy);  // gradient ribbons (flat fallback)
+  if (colorScheme == 5) return wheelColorAt(t.cx, t.cy, 0.5);    // wheel ribbons ride +0.5 (fallback)
+  if (colorScheme == 6) return wheelColorAt(t.cx, t.cy, 0);      // wheel-fg ribbons ride the wheel (fallback)
   if (colorScheme == 3) return gradSolid;                       // gradient-bg: solid ribbons
   if (colorScheme == 1) return ribbonColor(p, t.depth);         // multi: a palette colour per level
   boolean inv = invertPerLevel && (t.depth % 2 == 1);           // duotone: extremes, or 2 random (rotate)
@@ -1407,7 +1522,7 @@ color tileFg(Tile t) {
 
 // Canvas clear colour (shows in overscan / tiny gaps). Matches the depth-0 bg.
 color canvasBgColor() {
-  if (colorScheme == 2 || colorScheme == 4) return gradSolid;
+  if (colorScheme == 2 || colorScheme == 4 || colorScheme == 6) return gradSolid;  // solid ground (incl. wheel-fg)
   if (colorScheme == 0 && duoRandom)        return palettes.current().get(duoBgIdx);
   return palettes.current().lightest();
 }
@@ -1419,7 +1534,8 @@ color canvasBgColor() {
 // draw -- a new seed (or palette rotation) gives a new pairing. Uses random(),
 // so draw() re-seeds afterwards.
 void setupGradient() {
-  if (colorScheme < 2) return;   // schemes 2, 3, 4 are the gradient family
+  if (colorScheme < 2) return;   // schemes 2..6 are the gradient family
+  if (colorScheme >= 5) { setupWheel(); return; }   // 5 + 6 share the cyclic wheel
   Palette p = palettes.current();
   int n = p.size();
   int solidIdx = int(random(n));
@@ -1439,25 +1555,122 @@ void setupGradient() {
   }
   gradMin = lo; gradSpan = max(1, hi - lo);
 
-  // Build a matching Java2D paint for the smooth schemes (3, 4). The paint's
-  // start/end points are placed so its fraction equals gradientColor()'s t.
-  gradPaint = null;
-  if (gradStops.length >= 2) {
-    float sx = gradMin * gradCos,                sy = gradMin * gradSin;
-    float ex = (gradMin + gradSpan) * gradCos,   ey = (gradMin + gradSpan) * gradSin;
-    if (dist(sx, sy, ex, ey) > 1e-3) {
-      float[] fr = new float[gradStops.length];
-      Color[] cols = new Color[gradStops.length];
-      for (int i = 0; i < gradStops.length; i++) {
-        fr[i] = i / (float) (gradStops.length - 1);
-        int c = gradStops[i];
-        cols[i] = new Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
-      }
-      gradPaint = new LinearGradientPaint(new Point2D.Float(sx, sy),
-                                          new Point2D.Float(ex, ey), fr, cols);
-    }
+  // Build a matching Java2D paint for the smooth schemes (3, 4): linear along the
+  // axis, or radial about the centre -- placed so its fraction equals gradParam().
+  gradPaint = buildGradPaint();
+}
+
+// A non-cyclic Java2D paint over gradStops (schemes 3/4): LinearGradientPaint along
+// the axis, or RadialGradientPaint about the centre. Its fraction at a point matches
+// gradParam(): linear t = projection, radial t = distance/radius. null if < 2 stops.
+java.awt.Paint buildGradPaint() {
+  if (gradStops == null || gradStops.length < 2) return null;
+  float[] fr = new float[gradStops.length];
+  Color[] cols = new Color[gradStops.length];
+  for (int i = 0; i < gradStops.length; i++) {
+    fr[i] = i / (float) (gradStops.length - 1);
+    int c = gradStops[i];
+    cols[i] = new Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+  }
+  if (gradRadial) {
+    return new java.awt.RadialGradientPaint(new Point2D.Float(gradCx * width, gradCy * height),
+                                            gradRadius(), fr, cols);   // NO_CYCLE -> clamp
+  }
+  float sx = gradMin * gradCos,                sy = gradMin * gradSin;
+  float ex = (gradMin + gradSpan) * gradCos,   ey = (gradMin + gradSpan) * gradSin;
+  if (dist(sx, sy, ex, ey) < 1e-3) return null;
+  return new LinearGradientPaint(new Point2D.Float(sx, sy), new Point2D.Float(ex, ey), fr, cols);
+}
+
+// ---- gradient-wheel scheme (5): a cyclic, animated palette wheel -------------
+// The whole palette is laid round a 360 deg wheel (the last stop wraps back to
+// the first, so there is no seam) projected across the canvas; wheelPhase shifts
+// it continuously. gradStops holds the wheel colours; gradSolid is a constant
+// high-contrast ribbon colour. The axis + projection reuse the same gradMin/
+// gradSpan machinery, so gradientColor() and the Java2D paint stay in lockstep.
+void setupWheel() {
+  Palette p = palettes.current();
+  int n = p.size();
+  gradStops = new color[max(1, n)];
+  for (int i = 0; i < n; i++) gradStops[i] = p.get(i);
+  // A constant ribbon colour that contrasts the colourful wheel: pick the palette
+  // extreme furthest in luminance from the palette's mean (darkest or lightest).
+  float mean = 0; for (int i = 0; i < n; i++) mean += p.lum(p.get(i));
+  mean = (n > 0) ? mean / n : 0;
+  gradSolid = (mean >= 128) ? p.darkest() : p.lightest();
+  float a = random(TWO_PI);                              // random wheel axis
+  gradCos = cos(a); gradSin = sin(a);
+  float lo = 1e9, hi = -1e9;
+  float[] xs = { 0, width, 0, width }, ys = { 0, 0, height, height };
+  for (int i = 0; i < 4; i++) {
+    float pr = xs[i] * gradCos + ys[i] * gradSin;
+    lo = min(lo, pr); hi = max(hi, pr);
+  }
+  gradMin = lo; gradSpan = max(1, hi - lo);
+  gradPaint = null;                                      // scheme 5 uses wheelPaint(), not gradPaint
+  // Cyclic Java2D stop arrays: colours c0..c(n-1) then c0 again at fraction 1, so
+  // a CycleMethod.REPEAT paint wraps seamlessly. Built once; the phase is applied
+  // at draw time by translating the paint (wheelPaint), not by rebuilding here.
+  int m = max(2, gradStops.length + 1);
+  wheelCols = new Color[m]; wheelFr = new float[m];
+  for (int i = 0; i < m; i++) {
+    int c = gradStops[i % gradStops.length];
+    wheelCols[i] = new Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    wheelFr[i]   = i / (float) (m - 1);
+  }
+  // Cached colour LUT for the radial wheel paint (cyclic linear interpolation =
+  // exactly gradWheelAt). Built here once, reused by every RadialWheelPaint context.
+  int nw = gradStops.length;
+  wheelLUT = new int[WHEEL_LUT_N];
+  for (int i = 0; i < WHEEL_LUT_N; i++) {
+    float seg = (i / (float) WHEEL_LUT_N) * nw;
+    int ai = (int) seg % nw, bi = (ai + 1) % nw;
+    float f = seg - (int) seg;
+    int ca = gradStops[ai], cb = gradStops[bi];
+    int r = (int) (((ca >> 16) & 0xFF) * (1 - f) + ((cb >> 16) & 0xFF) * f + 0.5);
+    int g = (int) (((ca >>  8) & 0xFF) * (1 - f) + ((cb >>  8) & 0xFF) * f + 0.5);
+    int bl= (int) ((ca & 0xFF)         * (1 - f) + (cb & 0xFF)         * f + 0.5);
+    wheelLUT[i] = (r << 16) | (g << 8) | bl;
   }
 }
+
+// Build the cyclic wheel paint at phase (wheelPhase + extraPhase), matching
+// wheelColorAt() with the same extra. extraPhase = 0 for the background wheel; the
+// foreground rides +0.5 (scheme 5).
+//   LINEAR -- shift a fixed-stop LinearGradientPaint's start point back by ph*gradSpan
+//     (a geometric slide of a fixed colour LUT -> perfectly smooth).
+//   RADIAL -- an additive radial phase is NOT any geometric transform of a radial
+//     gradient, so RadialGradientPaint would have to rebuild its ~256-cell colour LUT
+//     every frame (cell boundaries jump as the phase shifts -> a temporal wobble).
+//     Instead use RadialWheelPaint, a custom Paint that computes each pixel's colour
+//     directly from the wheel (no LUT) -> the rings move as smoothly as the linear
+//     wheel, at ~the same per-pixel cost (RadialGradientPaint already measures the
+//     per-pixel distance; only its LUT lookup is replaced by an exact interpolation).
+java.awt.Paint wheelPaint(float extraPhase) {
+  if (wheelCols == null || wheelCols.length < 2) return null;
+  float ph = wheelPhase + extraPhase;
+  if (gradRadial)
+    return new RadialWheelPaint(gradCx * width, gradCy * height, gradRadius(), ph, wheelLUT);
+  float startProj = gradMin - ph * gradSpan;
+  float sx = startProj * gradCos,                sy = startProj * gradSin;
+  float ex = (startProj + gradSpan) * gradCos,   ey = (startProj + gradSpan) * gradSin;
+  if (dist(sx, sy, ex, ey) < 1e-3) return null;
+  return new LinearGradientPaint(new Point2D.Float(sx, sy), new Point2D.Float(ex, ey),
+                                 wheelFr, wheelCols,
+                                 java.awt.MultipleGradientPaint.CycleMethod.REPEAT);
+}
+
+// Rebuild the per-frame foreground wheel paint (called once at the top of
+// renderTiling). Scheme 5 ribbons ride a half-turn ahead of the bg wheel so they
+// always contrast it; scheme 6 has no bg wheel, so they ride it directly.
+void refreshWheelFgPaint() {
+  wheelFgPaint = schemeWheelFg() ? wheelPaint(colorScheme == 5 ? 0.5 : 0.0) : null;
+}
+
+// The Java2D paint for foreground bands/nubs when gradientStroke() is true:
+// scheme 4 = the static linear gradient (gradPaint); schemes 5/6 = the animated
+// cyclic wheel (the cached wheelFgPaint).
+java.awt.Paint fgPaint() { return schemeWheelFg() ? wheelFgPaint : gradPaint; }
 
 // Interpolate the gradient stops at parameter t in [0,1].
 color gradAt(float t) {
@@ -1468,20 +1681,42 @@ color gradAt(float t) {
   return lerpColor(gradStops[i], gradStops[i + 1], seg - i);
 }
 
-// Sample the gradient at a point (project onto the gradient axis, normalise).
-color gradientColor(float x, float y) {
-  return gradAt((x * gradCos + y * gradSin - gradMin) / gradSpan);
+// Cyclic sample of the wheel at parameter u (wraps mod 1; stop n == stop 0).
+color gradWheelAt(float u) {
+  if (gradStops == null || gradStops.length == 0) return color(0);
+  int n = gradStops.length;
+  if (n == 1) return gradStops[0];
+  u = u - floor(u);                    // wrap to [0,1)
+  float seg = u * n;                   // n cyclic segments
+  int i = int(seg) % n;
+  int j = (i + 1) % n;
+  return lerpColor(gradStops[i], gradStops[j], seg - floor(seg));
 }
 
-// Paint the whole canvas with the smooth gradient (scheme 3 background), using
-// the Java2D LinearGradientPaint so it is continuous (not stepped).
+// Cyclic wheel colour at a point, offset by (wheelPhase + extra).
+color wheelColorAt(float x, float y, float extra) {
+  return gradWheelAt(gradParam(x, y) + wheelPhase + extra);
+}
+
+// Sample the gradient at a point. gradParam() gives t (linear axis projection or
+// radial distance). Wheel schemes (5/6) sample the cyclic wheel at the animated
+// phase; others clamp linearly. (Background discs read offset 0; fg adds its own.)
+color gradientColor(float x, float y) {
+  if (colorScheme >= 5) return wheelColorAt(x, y, 0);
+  return gradAt(gradParam(x, y));
+}
+
+// Paint the whole canvas with the smooth gradient background (schemes 3 + 5),
+// using a Java2D LinearGradientPaint so it is continuous (not stepped). Scheme 5
+// uses the phase-shifted cyclic wheel paint; scheme 3 uses the static gradPaint.
 void drawGradientBackground() {
-  if (gradPaint == null) {                   // <2 distinct stops: fall back to flat
+  java.awt.Paint paint = (colorScheme == 5) ? wheelPaint(0) : gradPaint;
+  if (paint == null) {                       // <2 distinct stops: fall back to flat
     background(gradStops != null && gradStops.length > 0 ? gradStops[0] : color(0));
     return;
   }
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  g2.setPaint(gradPaint);
+  g2.setPaint(paint);
   g2.fill(new Rectangle2D.Float(0, 0, width, height));
 }
 
@@ -1586,13 +1821,18 @@ String appearanceTokens() {
     s += "_kumiko";
     if (round(stripWidthFrac * 100) != 10) s += round(stripWidthFrac * 100);   // strip width %
   }
+  if (colorScheme >= 5)                                            // gradient-wheel rate + phase
+    s += "_wheel" + round(wheelRate * 100) + "p" + round(wheelPhase * 100);
+  if (colorScheme >= 2 && gradRadial)                              // radial transient + centre
+    s += "_radial" + round(gradCx * 100) + "-" + round(gradCy * 100);
   if (metalMode) {
     s += "_metal-" + metalMatName() + (metalBevelStyle == 1 ? "-rim" : "");    // material always shown
     if (round(metalBevelPx) != 10)  s += "b" + round(metalBevelPx);
     if (round(metalLightDeg) != 118) s += "l" + round(metalLightDeg);
   }
   if (morphActive) s += "_morph" + round(morphT * 100) + "g" + morphGen          // mid-morph frame
-                      + (morphSpread > 0 ? "s" + round(morphSpread * 100) : "");  // staggered
+                      + (morphSpread > 0 ? "s" + round(morphSpread * 100) : "")   // staggered
+                      + (morphEasing != 0 ? "-" + MORPH_EASE_NAMES[morphEasing] : "");  // easing
   return s;
 }
 
@@ -1604,6 +1844,8 @@ String reproduceCmd(String base) {
   String cmd = "TRUCHET_SCALE=2"
     + " TRUCHET_SHAPE="  + shapeMode
     + " TRUCHET_SCHEME=" + colorScheme
+    + (colorScheme >= 5 ? " TRUCHET_WHEEL_RATE=" + nf(wheelRate, 1, 3) + " TRUCHET_WHEEL_PHASE=" + nf(wheelPhase, 1, 3) : "")
+    + (colorScheme >= 2 ? " TRUCHET_GRAD_RADIAL=" + (gradRadial ? 1 : 0) + " TRUCHET_GRAD_CX=" + nf(gradCx, 1, 3) + " TRUCHET_GRAD_CY=" + nf(gradCy, 1, 3) : "")
     + " TRUCHET_PALETTE=" + palettes.current
     + " TRUCHET_ANCHORS=" + anchorsPerSide
     + " TRUCHET_TILESET=" + activeIdxFor(curN(), anchorsPerSide)
@@ -1654,7 +1896,9 @@ String reproduceCmd(String base) {
   }
   if (morphActive)      // a mid-morph frame: pin the phase + which target roll + stagger
     cmd += " TRUCHET_MORPH=1 TRUCHET_MORPH_T=" + nf(morphT, 1, 3) + " TRUCHET_MORPH_GEN=" + morphGen
-         + " TRUCHET_MORPH_SPREAD=" + nf(morphSpread, 1, 2);
+         + " TRUCHET_MORPH_SPREAD=" + nf(morphSpread, 1, 2)
+         + " TRUCHET_MORPH_EASE=" + morphEasing
+         + " TRUCHET_MORPH_CAP=" + morphCap;
   cmd += " TRUCHET_OUT=" + renderDir() + base + "_hires.png"
     + " processing-java --sketch=" + sketchPath("") + " --run";
   return cmd;
@@ -1675,6 +1919,8 @@ JSONObject renderManifest() {
 
   JSONObject r = new JSONObject();
   r.setInt("shape", shapeMode);          r.setInt("scheme", colorScheme);
+  r.setFloat("wheelRate", wheelRate);    r.setFloat("wheelPhase", wheelPhase);
+  r.setBoolean("gradRadial", gradRadial); r.setFloat("gradCx", gradCx); r.setFloat("gradCy", gradCy);
   r.setInt("seed", seedVal);             r.setInt("grid", gridN);
   r.setInt("depth", maxDepth);           r.setFloat("subdiv", subdivideProb);
   r.setInt("sym", symmetryMode);         r.setInt("anchors", anchorsPerSide);
@@ -1694,7 +1940,8 @@ JSONObject renderManifest() {
   r.setFloat("vpX", vpX);                r.setFloat("vpY", vpY);
   r.setFloat("extrudeDepth", extrudeDepth); r.setFloat("extrudeShade", extrudeShade);
   r.setBoolean("morph", morphActive);    r.setFloat("morphT", morphT);   r.setInt("morphGen", morphGen);
-  r.setFloat("morphSpread", morphSpread);
+  r.setFloat("morphSpread", morphSpread); r.setInt("morphEasing", morphEasing);
+  r.setInt("morphCap", morphCap);
   r.setBoolean("imageMode", imageMode);
   if (imagePath != null) r.setString("img", imagePath);
   r.setInt("imgCols", imgCols);          r.setInt("imgLib", libSize);
@@ -1739,6 +1986,11 @@ boolean loadManifest(String path) {
   if (r != null) {
     shapeMode      = r.getInt("shape", shapeMode);
     colorScheme    = r.getInt("scheme", colorScheme);
+    wheelRate      = r.getFloat("wheelRate", wheelRate);
+    gradRadial     = r.getBoolean("gradRadial", gradRadial);
+    gradCx         = r.getFloat("gradCx", gradCx);
+    gradCy         = r.getFloat("gradCy", gradCy);
+    wheelPhase     = r.getFloat("wheelPhase", wheelPhase);
     seedVal        = r.getInt("seed", seedVal);
     gridN          = r.getInt("grid", gridN);
     maxDepth       = r.getInt("depth", maxDepth);
@@ -1777,6 +2029,8 @@ boolean loadManifest(String path) {
     morphT         = r.getFloat("morphT", morphT);
     morphGen       = r.getInt("morphGen", morphGen);
     morphSpread    = r.getFloat("morphSpread", morphSpread);
+    morphEasing    = r.getInt("morphEasing", morphEasing);
+    morphCap       = r.getInt("morphCap", morphCap);
     if (morphActive) headlessMorph = true;    // a loaded morph frame is a pinned phase
     imageMode      = r.getBoolean("imageMode", imageMode);
     if (r.hasKey("img")) imagePath = r.getString("img");
@@ -1927,9 +2181,10 @@ void keyPressed() {
     dirtyGradient = true;
     redraw();
   } else if (key == 'c' || key == 'C') {   // cycle colour scheme
-    colorScheme = (colorScheme + 1) % 5;
+    colorScheme = (colorScheme + 1) % 7;
     println("colour scheme: " + schemeName(colorScheme));
     dirtyGradient = true;
+    refreshLoopState();                    // gradient-wheel (5) animates -> ensure the loop runs
     redraw();
   } else if (key == 'r' || key == 'R') {   // rotate: 2 random duotone colours, else cycle order
     rotatePalette();

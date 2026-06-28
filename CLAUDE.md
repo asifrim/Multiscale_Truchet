@@ -236,7 +236,13 @@ Optional overrides: `TRUCHET_LOAD` (path to a render manifest `.json` — restor
 complete recipe as a baseline; any other `TRUCHET_*` set alongside still overrides it,
 e.g. `TRUCHET_LOAD=foo.json TRUCHET_SCALE=4` re-renders the saved frame at 8K — see
 "Render manifest" above), `TRUCHET_SHAPE` (0 square, 1 triangle, 2 hexagon, 3 trapezoid),
-`TRUCHET_SCHEME` (0–4), `TRUCHET_SEED`, `TRUCHET_PALETTE` (index, wraps),
+`TRUCHET_SCHEME` (0–6; 5 = animated gradient-wheel bg+fg, 6 = gradient-wheel-fg
+solid-bg fg-only — see "Gradient-wheel colour schemes"), `TRUCHET_WHEEL_RATE` (wheel
+turns/sec), `TRUCHET_WHEEL_PHASE` (pin the wheel phase 0..1 for a deterministic
+headless frame), `TRUCHET_GRAD_RADIAL` (0/1 = radial vs linear gradient transient — see
+"Radial transient"), `TRUCHET_GRAD_CX`/`TRUCHET_GRAD_CY` (radial centre, normalised
+0..1), `TRUCHET_SEED`,
+`TRUCHET_PALETTE` (index, wraps),
 `TRUCHET_DUO` (`"bgIdx,fgIdx"` = duotone fg/bg as two palette-colour indices, the
 reproducible form of the duotone "rotate"; omit for the default luminance extremes),
 `TRUCHET_SYM` (0–7),
@@ -279,6 +285,68 @@ frame at that phase), `TRUCHET_ANIM_RATE` (master LFO Hz), `TRUCHET_ANIM_DEPTH`
 (set all LFO depths so motion is visible), and `TRUCHET_ANIM="name=v01,..."` to
 pin exact registry values (e.g. `discMod=1.0`, `rotationMod=0.85`), which also
 exercises the future MIDI sink.
+One-shot tile morph (motif cross-dissolve — keys `o`/`O`, Controls "morph
+tiles"/"morph staggered"; pin a mid-morph frame headless): `TRUCHET_MORPH` (0/1),
+`TRUCHET_MORPH_T` (phase 0..1), `TRUCHET_MORPH_GEN` (which target roll),
+`TRUCHET_MORPH_DUR` (seconds — sets *every* level), `TRUCHET_MORPH_DUR_LEVELS`
+(per-level durations `"1.5,1.0,0.6,…"` by depth 0.. — see "Per-level morph
+duration" below), `TRUCHET_MORPH_SPREAD` (0 in-sync, >0 staggered),
+and `TRUCHET_MORPH_EASE` (the morph's easing curve — an index OR a name from
+`MORPH_EASE_NAMES`: `smoothstep` (default, byte-identical to before), `linear`,
+and the full https://github.com/ai/easings.net set as `in/out/inOut` × `Sine/Quad/
+Cubic/Quart/Quint/Expo/Circ/Back/Elastic/Bounce`; Controls "Anim" tab cycles it
+via the "ease: …" button). The morph's raw 0..1 progress is run through the
+selected curve in `applyMorphEasing` (`Animation.pde`), shared by `morphMix()`
+(uniform) and `morphLocalMix()` (staggered).
+`TRUCHET_MORPH_CAP` sets the **band-cap style for the morphing ends** — an index OR
+a name from `MORPH_CAP_NAMES`: `butt` (default, the original flush look,
+byte-identical to before), `round`, `square` (Controls "Anim" tab cycles it via the
+"morph cap: …" button). A morph truncates a band to its reveal fraction, so the
+growing/retracting end sits in the tile **interior** (not at a tile edge) where a
+flat butt reads as an abrupt cut; the cap rounds/squares those interior ends. It is
+applied **only while a morph is active** (`bandCap()` in `Shapes.pde`, gated on
+`morphActive`), and the tile clip still flattens any band that genuinely ends at an
+edge — so the seamless edge invariant is untouched and a non-morph (or `butt`) frame
+is byte-identical. Whole hexagons keep their `ROUND` cap regardless. Wired into
+`reproduceCmd` and the render manifest (`morphCap`) like the other morph params.
+**Per-level morph duration.** Morph speed is **per multiscale level**, not global:
+`morphDurLevel[depth]` (seconds; `MAX_MORPH_LV = 7` for depth 0..6) lets finer
+(deeper) levels morph faster than coarse ones. The Controls "Anim" tab shows one
+compact `L<d> dur` slider per level (only levels `<= maxDepth` are shown; deeper
+slots stay reserved so the widgets below keep a fixed position — `Slider.visible`).
+Both modes read `morphDurFor(depth)`: continuous mode advances each tile's `mphT` by
+`dt / morphDurFor(t.depth)`; the one-shot runs its global `morphT` over
+`morphMaxDur()` (the slowest active level) and `morphLocalMix()` scales each tile's
+progress by `morphMaxDur()/morphDurFor(depth)` so a finer level reaches mix 1 sooner
+and the coarsest finishes last. **All levels equal ⇒ byte-identical to the old single
+`morphDurationSec`** (scale 1, timeline = that duration — verified: uniform 1.5 ≡
+uniform 3.0 at a pinned phase, and per-level-all-1.5 ≡ uniform). Headless:
+`TRUCHET_MORPH_DUR` sets every level; `TRUCHET_MORPH_DUR_LEVELS="1.5,1.0,0.6,…"`
+sets them per depth. Duration is pure *timing* (not frame appearance), so — like the
+old `morphDurationSec` — it is **not** in the filename / `reproduceCmd` / manifest.
+Continuous **morph mode** (`morphMode`, Controls "Anim" tab "morph mode" toggle,
+`TRUCHET_MORPH_MODE`): instead of one global one-shot, **each tile independently
+rolls a per-frame chance of starting its own morph** (ignored while it is already
+morphing), cross-dissolving to a fresh target with the selected easing/cap — a
+constantly shifting field. `morphProb` ("morph prob" slider, `TRUCHET_MORPH_PROB`)
+is the expected morph **starts per tile per second** (per-frame chance =
+`morphProb / animFrameRate`). Per-tile state lives on the `Tile` (`mphT` phase,
+`morphCount`); the trigger (`morphTrigger`) and target rolls (`rollOneTarget` salted
+by `morphCount` via `morphSalt`) are **hash-driven exactly like the one-shot**, so
+under structural symmetry a twin and its source key on the same `(mi,mk,depth)` and
+therefore fire on the *same frame* and roll the *same target* — staying mirror-exact
+(verified: a sym-mode-5 morph field has the same mirror diff as the static
+structural baseline). Both the one-shot (`morphActive`) and continuous mode engage
+the render via `morphRendering()`; with neither on the render is byte-identical
+(`morphCount` is 0 on the one-shot path, so `morphSalt` collapses to the original
+salts and one-shot target rolls are unchanged — verified byte-identical). The
+Controls toggle routes through `morphModeChanged` (applied on the viz thread in
+`applyMorphModeChange`, like the Save/Reload flags) since it mutates `leaves` + the
+loop state; `updateMorphMode()` runs once per `draw()` after the layout is built/
+synced (`syncMorphIdle` settles fresh leaves to idle so a non-zero motif doesn't read
+as an instant morph). Headless is continuous-by-nature so it can't show motion in one
+frame; `TRUCHET_MORPH_FRAMES=N` pre-rolls N deterministic steps before saving (the
+verification hook).
 Light pulse (comet along the connection paths — see `Pulse.pde`): `TRUCHET_PULSE`
 (0/1 enable), `TRUCHET_PULSE_SPEED` (px/s), `TRUCHET_PULSE_TRAIL` (comet trail px),
 `TRUCHET_PULSE_COUNT` (0 = all paths, else the N longest), `TRUCHET_PULSE_COLOR`
@@ -670,6 +738,123 @@ colour (only the ink is materialised); under image mode a metal change sets `img
 1080p, a few seconds at 8K (a render-time pass, not for live animation). A future
 option is a GLSL/deferred lighting pass for speed + true cubemap reflections.
 
+### Radial transient (linear vs radial gradient direction)
+
+`gradRadial` (Controls Color-tab "radial transient" toggle, `TRUCHET_GRAD_RADIAL`)
+switches the whole gradient family (schemes 2–6, the animated wheel included) from the
+default **unidirectional linear** transient (colour projected along an axis) to a
+**radial** one (colour by distance from a centre, radiating in rings). The centre is
+`gradCx`/`gradCy` in normalised canvas coords (Controls "radial cx"/"radial cy"
+sliders, `TRUCHET_GRAD_CX`/`TRUCHET_GRAD_CY`, default 0.5,0.5 — adjustable live). The
+seam is `gradParam(x,y)` → the gradient parameter `t∈[0,1]`: linear = axis projection
+`(x·cos+y·sin−min)/span`; radial = `dist(point, centre)/gradRadius()` (radius = the
+furthest canvas corner, so `t` spans 0 at the centre to 1 at the corner). Both
+`gradientColor()` (per-point: wing discs, scheme-2 flat ribbons) and the Java2D paints
+read it, so they stay in lockstep:
+- **Non-cyclic paint** (schemes 3 bg / 4 fg) — `buildGradPaint()` returns a
+  `LinearGradientPaint` along the axis or a `RadialGradientPaint` about the centre.
+- **Wheel paint** (schemes 5/6) — `wheelPaint(extra)`: linear keeps the exact
+  start-point-shift trick (a fixed-stop `LinearGradientPaint` whose geometry slides);
+  radial returns **`RadialWheelPaint`** (`RadialWheel.pde`), a custom `java.awt.Paint`
+  that computes each pixel's colour directly from the wheel (see "Smooth radial
+  animation" below), so the rings expand/contract from the centre as the phase advances.
+
+**Smooth radial animation (why the radial wheel is a custom Paint).** An additive
+radial *phase* is not any geometric transform of a radial gradient (you can't
+translate/scale a `RadialGradientPaint` to add to the radius). So a stock
+`RadialGradientPaint` would have to **rebuild its colour LUT every frame** as the phase
+shifts, and the LUT's cell boundaries jump (a faint frame-to-frame wobble); the linear
+wheel avoids this by sliding a *fixed* LUT geometrically. `RadialWheelPaint` stays exact
++ smooth (`std/mean ≈ 0.011`, the *ideal* radial floor — the small remainder is the
+inherent, monotonic effect of rings sweeping ever-larger annuli, not jitter).
+
+**Performance matters here** because the live loop runs at `animFrameRate`: a slow paint
+shows up not as a bad still frame (freeze frames always looked fine) but as **dropped
+frames / stutter** — which is what reads as "less smooth". Getting it to parity with the
+linear wheel took three passes, each removing per-pixel work:
+1. *Cached colour wheel LUT* (`wheelLUT`, built once per palette in `setupWheel`, NOT in
+   the `PaintContext`). Java2D calls `createContext` once per fill/stroke and the
+   foreground issues thousands of them (each tile's bands + every wing nub/disc), so a
+   per-context LUT build was a large hidden cost.
+2. *Inlined, incremental transform* — the device→user inverse affine is applied with
+   per-row setup + a per-pixel add, not a per-pixel `AffineTransform.transform()` call.
+3. *Distance²→colour LUT* — instead of a `sqrt` per pixel, each Paint precomputes an
+   ~8k-entry table keyed by `d²` with the phase baked in (one `sqrt` per entry). d²(i)
+   along a row is quadratic, so it is advanced by its constant second difference (two
+   adds per pixel); a pixel is then just `d²·scale → clamp → table lookup → ARGB write`,
+   with **no per-pixel sqrt or multiply-heavy transform**. The d² bins are fixed in
+   space and the colour content is a smooth resampling of the phase, so motion stays
+   smooth (no rebuild-boundary wobble).
+
+That took it from ~0.5 s/frame slower than linear (original exact-per-pixel version,
+visibly stuttering) to **measurably equal** to the linear wheel at 4K. Because it is a
+`Paint`, every fill/stroke site (background fill, ribbon strokes, wing nubs/discs) uses
+it unchanged via `g2.setPaint()`. It is **only** used for the animated radial *wheel*;
+the static radial schemes 3/4 keep `RadialGradientPaint` (no phase → no LUT rebuild → no
+wobble), and the linear wheel keeps its fixed-LUT slide. Verified visually identical to
+the exact render (max 3/255 per channel) and the linear wheel byte-identical (off-path).
+
+Off ⇒ byte-identical (radial defaults off; `gradParam` returns the exact old linear
+projection — verified schemes 4 + 5 unchanged). Wired into the filename
+(`_radial<cx%>-<cy%>` when on), `reproduceCmd` (`TRUCHET_GRAD_RADIAL`/`_CX`/`_CY`, when
+`colorScheme >= 2`), and the render manifest (`gradRadial`/`gradCx`/`gradCy`); a radial
+frame reproduces byte-identically from its manifest (verified). The linear axis stays
+seed-derived (random, reproducible), so only the radial centre needs storing. Moving
+the centre sets `dirtyGradient` so the static schemes (3/4) rebuild `gradPaint`; the
+wheel paints rebuild every frame and pick it up live.
+
+### Gradient-wheel colour schemes (animated cyclic gradient)
+
+Two schemes share an **adapted smooth gradient**: the *whole* palette arranged around a
+**360° wheel** — a cyclic gradient where the last stop wraps back to the first, so there
+is no seam — whose phase **animates**, so the gradient continuously transitions through
+the palette:
+- **`colorScheme == 5` ("gradient-wheel")** — background **and** foreground are the
+  wheel. Structurally scheme 3 (`schemeBgGradient()`): the smooth wheel fills the
+  canvas (bg polygon skipped, wing corner discs sample it), **and** the ribbons are
+  painted with the wheel too, riding **a half-turn (+0.5) ahead** of the background so
+  they always contrast it as it rotates.
+- **`colorScheme == 6` ("gradient-wheel-fg")** — like scheme 4 (gradient-smooth): a
+  **solid** ground (`gradSolid`), only the **foreground** ribbons painted with the
+  animated wheel (no background wheel, ribbons ride the wheel directly).
+
+Both are reached by key **C** / the Controls scheme button / `TRUCHET_SCHEME=5|6`.
+Mechanism:
+- **Cyclic + phased sampling.** `setupWheel()` (called from `setupGradient` for scheme
+  5 *or* 6) sets `gradStops` to the full palette, picks `gradSolid` as the palette
+  luminance extreme furthest from the mean (the solid ground / fallback), and builds
+  cyclic Java2D stop arrays (`wheelCols`/`wheelFr` = `c0..c(n-1), c0`).
+  `gradWheelAt(u)` wraps mod 1 (stop n == stop 0); `wheelColorAt(x,y,extra)` projects a
+  point onto the axis and samples at `t + wheelPhase + extra`.
+- **Smooth background (scheme 5).** `drawGradientBackground()` paints via
+  `wheelPaint(0)` — a `LinearGradientPaint` with `CycleMethod.REPEAT` whose start point
+  is shifted back by `wheelPhase·gradSpan`, so its fraction equals `wheelColorAt`'s
+  `t + wheelPhase` exactly (bg + wing discs stay in lockstep). Cyclic stops make the
+  REPEAT wrap seamless (verified: phase 0.0 ≡ 1.0, byte-identical, both schemes).
+- **Smooth foreground (schemes 5 + 6).** `schemeWheelFg()` groups them;
+  `gradientStroke()` returns true so the ribbons/nubs are stroked/filled with `fgPaint()`
+  = `wheelFgPaint`, the per-frame paint rebuilt at the top of `renderTiling()` by
+  `refreshWheelFgPaint()` at `wheelPaint(colorScheme==5 ? 0.5 : 0)`. (Scheme 4 still
+  uses the static `gradPaint`; `fgPaint()`/`gradientStroke()` dispatch between them, and
+  every former `gradPaint` stroke/fill site now goes through `fgPaint()`.)
+- **Animated, rate-controlled.** `wheelPhase` advances in `updateAnim()` by
+  `wheelRate · dt` (`wheelRate` = wheel **turns per second**, Controls Color-tab
+  "wheel rate" slider / `TRUCHET_WHEEL_RATE`, default 0.15). Loop control is unified in
+  `anyAnimRunning()`/`refreshLoopState()` (called at the end of `draw()`): the sketch
+  loops whenever the LFO animation, a morph, **or** a wheel scheme (`colorScheme >= 5`
+  with rate ≠ 0) is active, and goes static otherwise — so selecting a wheel scheme or
+  moving its rate slider (even from the Controls thread) settles the loop on the viz
+  thread without cross-thread `loop()`/`noLoop()`.
+
+Off ⇒ byte-identical (schemes 0–4 untouched — verified scheme 0 and scheme 4 are
+unchanged by these edits). Headless freezes the wheel (`headlessWheel`, set whenever
+`TRUCHET_OUT` is present or `TRUCHET_WHEEL_PHASE` pins the phase) so a single frame
+renders the exact saved phase and a **manifest reproduces byte-identically** (verified:
+phase 0.4 round-trips through the JSON sidecar with max diff 0 for both schemes). Wired
+into the filename (`_wheel<rate%>p<phase%>`), `reproduceCmd`
+(`TRUCHET_WHEEL_RATE`/`TRUCHET_WHEEL_PHASE`, when `colorScheme >= 5`), and the manifest
+(`wheelRate`/`wheelPhase`). Headless pin: `TRUCHET_WHEEL_PHASE` (0..1).
+
 ## Structure of the sketch
 
 The `.pde` tabs are merged into one PApplet:
@@ -770,18 +955,24 @@ The `.pde` tabs are merged into one PApplet:
     live in `TRAP_W` (not `weightsFor(n)`, which would alias the square); subdivided
     detail uses the triangle alphabet (`TRI_CONNS`/`TRI_W`).
 - **`Palettes.pde`** — `PaletteManager`/`Palette`; colour source. `colorScheme`
-  (`schemeName`) selects one of four: duotone (lightest/darkest, inverted per
+  (`schemeName`) selects one of **seven**: duotone (lightest/darkest, inverted per
   level), multi (`ribbonColor()`: light ground, one palette colour per level),
   gradient (`gradientColor`: one random solid ground colour, bands sample a
   random-direction gradient of the other colours, one flat colour per tile),
   gradient-bg (a *smooth* full-canvas gradient, solid ribbons; `drawPolyTile`
-  skips the bg polygon when `colorScheme==3` so the gradient shows through), or
+  skips the bg polygon when the bg IS the gradient so it shows through),
   gradient-smooth (solid ground, ribbons painted with the smooth gradient
-  continuously). The gradient family shares `setupGradient()`, which also builds
+  continuously), **gradient-wheel (5)** (animated cyclic wheel on *both* bg + fg),
+  or **gradient-wheel-fg (6)** (solid ground, animated wheel on the fg only) —
+  see "Gradient-wheel colour schemes" below. The
+  gradient family shares `setupGradient()`, which also builds
   a Java2D `LinearGradientPaint` (`gradPaint`) matching `gradientColor`'s
   projection; schemes 3 and 4 use it via `g2` (`drawGradientBackground` fills the
   canvas; `gradientStroke()`/`drawTileBands`/`fillDiscG2` stroke the bands and wing
-  discs). `tileFg`/`tileBg` take the `Tile` (gradient needs position). Keys
+  discs). The two **background-gradient** schemes (3 + 5) are grouped by the helper
+  `schemeBgGradient()` (bg polygon skipped, wing corner discs sample the gradient,
+  ribbons solid), so adding the wheel touched one predicate, not every call site.
+  `tileFg`/`tileBg` take the `Tile` (gradient needs position). Keys
   `p`/`P` palettes, `R`/Controls "rotate" = `rotatePalette()` (scheme-aware: in
   **duotone** it picks two random palette colours for fg/bg — `rotateDuotone` sets
   `duoRandom` + `duoBgIdx`/`duoFgIdx` (bg = the lighter), read by
@@ -812,7 +1003,8 @@ The `.pde` tabs are merged into one PApplet:
     sliders + winged, grid-overlay toggles), **Color** (scheme, palette
     prev/next/rotate + swatches, invert/level), **Sym** (symmetry mode + a help blurb),
     **Shadow** (drop/global shadow + angle/size/strength, extrude 3D + mode, vp x/y,
-    extrude depth/shade), **Anim** (animate, rate, disc/band/rot/arc depth), **Render**
+    extrude depth/shade), **Anim** (animate, rate, disc/band/rot/arc depth, pulse,
+    one-shot morph + per-level dur/ease/cap, continuous morph mode + prob), **Render**
     (line mode, count/duty/subdiv, kumiko style, strip width), and **Image** (image mode
     + halftone params + Load image). Each widget carries a `tab` index;
     `draw()`/`mousePressed()` only render + hit-test the active tab's widgets (plus the
@@ -874,6 +1066,13 @@ The `.pde` tabs are merged into one PApplet:
   edges. Controls default the safe channel on, breaking ones at depth 0 (labelled
   `*` in the panel). The registry also carries `pulseSpeedMod/pulseWidthMod/
   pulseGlowMod` for the light-pulse overlay (see `Pulse.pde`).
+  Also houses the **tile morph** (one-shot + continuous): the one-shot
+  `beginMorph`/`commitMorph` cross-dissolve and the continuous **morph mode**
+  (`morphMode`/`updateMorphMode`/`morphTrigger`/`syncMorphIdle`) where each tile
+  rolls its own per-frame morph trigger — see "One-shot tile morph" / "Continuous
+  morph mode" above. Both feed the same per-tile `applyMorphUnion` render path via
+  `morphRendering()`; the hash-driven trigger/target rolls keep structural-symmetry
+  twins in lockstep, and `morphCount`-salting keeps the one-shot byte-identical.
 - **`Pulse.pde`** — an animated **light pulse** (comet: bright head + fading trail)
   flowing along the connection curves, like energy through an energized circuit. It
   is a pure **overlay**: never touches `leaves`/`dirtyLayout`, fully gated (off ⇒
@@ -942,6 +1141,10 @@ The `.pde` tabs are merged into one PApplet:
   `edt1d`), the 1-bit ink-mask render (`buildInkMask`/`maskTileBg`/`maskTileFg`,
   `tileInkInverted`), and `drawMetalTiling` which ties SDF → normals → shade →
   composite. Self-contained Java2D (no OpenGL/GLSL).
+- **`RadialWheel.pde`** — `RadialWheelPaint`/`RadialWheelContext`, the custom
+  `java.awt.Paint` for the animated **radial gradient-wheel** (schemes 5/6 with
+  `gradRadial`): exact per-pixel wheel colour, no LUT, so the radial phase animates as
+  smoothly as the linear wheel (see "Smooth radial animation" above).
 - **Layout caching** (main tab): `leaves`/gradient are rebuilt only when
   `dirtyLayout`/`dirtyGradient` are set (in `rebuildLeaves`/`setupGradient` guards),
   not every animated frame. Every layout-affecting mutator (seed, grid, depth,

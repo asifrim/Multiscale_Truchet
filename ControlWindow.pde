@@ -72,17 +72,20 @@ public class ControlWindow extends PApplet {
   Slider sGrid, sDepth, sSubdiv;
   Slider sShadowAngle, sShadowSize, sShadowStrength, sVpx, sVpy, sExtrudeDepth, sExtrudeShade;
   Slider sAnimRate, sDiscDepth, sBandDepth, sRotDepth, sArcDepth;
-  Slider sPulseSpeed, sPulseTrail, sPulseCount, sMorphDur;
+  Slider sPulseSpeed, sPulseTrail, sPulseCount, sMorphProb, sWheelRate, sGradCx, sGradCy;
+  Slider[] sMorphDurLv;     // per-level morph duration (allocated in setup once parent is set)
+  int morphDurHdrY;
   Slider sLineCount, sLineDuty, sLineSubdiv, sStripWidth;
   Slider sMetalBevel, sMetalLight;
   Slider sImgCols, sImgLib, sImgGamma;
 
   // ---- named toggle refs ----
   Toggle tgWinged, tgGrid, tgInvert, tgShadow, tgShadowGlobal, tgExtrude, tgAnim,
-         tgLine, tgKumiko, tgMetal, tgImage, tgImgStretch, tgImgInvert, tgImgContain, tgPulse;
+         tgLine, tgKumiko, tgMetal, tgImage, tgImgStretch, tgImgInvert, tgImgContain, tgPulse,
+         tgMorphMode, tgRadial;
 
   // ---- named button refs ----
-  Button bScheme, bExtrude, bPrev, bNext, bRot, bImgLoad, bMetalMat, bMetalStyle, bMorph, bMorphStagger;
+  Button bScheme, bExtrude, bPrev, bNext, bRot, bImgLoad, bMetalMat, bMetalStyle, bMorph, bMorphStagger, bMorphEase, bMorphCap;
   Button[] symBtns;                            // segmented switch, one per symmetry mode
   Button bSeed, bSave, bLoadRender;            // persistent action bar (tab == -1)
 
@@ -165,7 +168,13 @@ public class ControlWindow extends PApplet {
     bPrev = addButton(TAB_COLOR, "<",      colX,      y, 30, 32);
     bNext = addButton(TAB_COLOR, ">",      colX + 34, y, 30, 32);
     bRot  = addButton(TAB_COLOR, "rotate", colX + 68, y, 60, 32);
-    swatchY = y; swatchH = 32;
+    swatchY = y; swatchH = 32; y += swatchH + 16;
+    // gradient-wheel scheme (5): how fast the cyclic palette wheel rotates (turns/sec)
+    sWheelRate = addSlider(TAB_COLOR, "wheel rate", y, 0, 1, parent.wheelRate, false); y += rowH + 8;
+    // radial transient: colour radiates from a centre instead of along a linear axis.
+    tgRadial = addToggle(TAB_COLOR, "radial transient", colX, y, parent.gradRadial); y += 34;
+    sGradCx = addSlider(TAB_COLOR, "radial cx", y, 0, 1, parent.gradCx, false); y += rowH;
+    sGradCy = addSlider(TAB_COLOR, "radial cy", y, 0, 1, parent.gradCy, false);
 
     // ===== TAB: Symmetry =====
     // A segmented switch: one cell per symmetry mode (selected one accented).
@@ -210,7 +219,22 @@ public class ControlWindow extends PApplet {
     sPulseCount = addSlider(TAB_ANIM, "pulse count", y, 0, 30,  parent.pulseCount,  true); y += rowH + 8;
     bMorph       = addButton(TAB_ANIM, "morph tiles",     colX, y, contentW / 2 - 4, 30);
     bMorphStagger= addButton(TAB_ANIM, "morph staggered", colX + contentW / 2 + 4, y, contentW / 2 - 4, 30); y += 38;
-    sMorphDur   = addSlider(TAB_ANIM, "morph dur", y, 0.2, 5, parent.morphDurationSec, false);
+    // per-level morph duration (seconds): finer/deeper levels can morph faster.
+    // One compact slider per depth; only levels <= maxDepth are shown (the rest
+    // reserve their slots so the widgets below keep a fixed position).
+    morphDurHdrY = y; y += 22;
+    sMorphDurLv = new Slider[parent.MAX_MORPH_LV];
+    for (int i = 0; i < parent.MAX_MORPH_LV; i++) {
+      sMorphDurLv[i] = addSlider(TAB_ANIM, "L" + i + " dur", y, 0.1, 5, parent.morphDurLevel[i], false);
+      y += 32;
+    }
+    y += 8;
+    bMorphEase  = addButton(TAB_ANIM, "ease: smoothstep", colX, y, contentW, 30); y += 38;
+    bMorphCap   = addButton(TAB_ANIM, "morph cap: butt", colX, y, contentW, 30); y += 38;
+    // continuous morph mode: each tile randomly starts its own morph (morph prob =
+    // expected starts per tile per second), using the easing/cap/dur above.
+    tgMorphMode = addToggle(TAB_ANIM, "morph mode", colX, y, parent.morphMode); y += 34;
+    sMorphProb  = addSlider(TAB_ANIM, "morph prob", y, 0, 3, parent.morphProb, false);
 
     // ===== TAB: Rendering (line mode / kumiko) =====
     y = contentTop;
@@ -327,8 +351,15 @@ public class ControlWindow extends PApplet {
       ? "Load image…" : "Image: " + imgBaseName(parent.imagePath);
     bMetalMat.label   = "metal: " + parent.metalMatName();
     bMetalStyle.label = "bevel: " + (parent.metalBevelStyle == 1 ? "flat-rim" : "round");
+    bMorphEase.label  = "ease: " + parent.MORPH_EASE_NAMES[parent.morphEasing];
+    bMorphCap.label   = "morph cap: " + parent.MORPH_CAP_NAMES[parent.morphCap];
 
-    for (Slider s : sliders) if (shown(s.tab)) drawSlider(s);
+    // per-level morph-dur sliders: only show levels that can exist at the current
+    // max depth (depth 0..maxDepth); deeper sliders stay hidden but reserve space.
+    for (int i = 0; i < parent.MAX_MORPH_LV; i++)
+      if (sMorphDurLv[i] != null) sMorphDurLv[i].visible = (i <= parent.maxDepth);
+
+    for (Slider s : sliders) if (shown(s.tab) && s.visible) drawSlider(s);
     for (Toggle t : toggles) if (shown(t.tab)) drawToggle(t);
     for (Button b : buttons) if (shown(b.tab)) drawButton(b);
 
@@ -359,6 +390,8 @@ public class ControlWindow extends PApplet {
     } else if (activeTab == TAB_ANIM) {
       fill(150); textAlign(LEFT, CENTER);
       text("* breaks seamless connection (expressive)", colX, animLabelY);
+      fill(170);
+      text("morph dur / level (s) — finer levels faster", colX, morphDurHdrY + 8);
     } else if (activeTab == TAB_IMAGE) {
       fill(170); textAlign(LEFT, CENTER);
       text("Truchet halftone of a source image", colX, imgLabelY);
@@ -840,7 +873,7 @@ public class ControlWindow extends PApplet {
 
     // control-column sliders (active tab)
     for (Slider s : sliders) {
-      if (shown(s.tab) && hitSlider(s)) { active = s; setSliderFromMouse(s); return; }
+      if (shown(s.tab) && s.visible && hitSlider(s)) { active = s; setSliderFromMouse(s); return; }
     }
 
     // persistent action bar
@@ -856,7 +889,8 @@ public class ControlWindow extends PApplet {
         break;
       case TAB_COLOR:
         if (tgInvert.hit(mouseX, mouseY)) { tgInvert.value = !tgInvert.value; parent.logAction("CTRL invert -> " + tgInvert.value); syncParent(); return; }
-        if (bScheme.hit(mouseX, mouseY))  { parent.colorScheme = (parent.colorScheme + 1) % 5; parent.logAction("CTRL scheme -> " + parent.schemeName(parent.colorScheme)); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
+        if (tgRadial.hit(mouseX, mouseY)) { tgRadial.value = !tgRadial.value; parent.gradRadial = tgRadial.value; parent.logAction("CTRL radial -> " + tgRadial.value); parent.dirtyGradient = true; parent.redraw(); return; }
+        if (bScheme.hit(mouseX, mouseY))  { parent.colorScheme = (parent.colorScheme + 1) % 7; parent.logAction("CTRL scheme -> " + parent.schemeName(parent.colorScheme)); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
         if (bPrev.hit(mouseX, mouseY))    { parent.palettes.prev(); parent.duoRandom = false; parent.logAction("CTRL palette prev"); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
         if (bNext.hit(mouseX, mouseY))    { parent.palettes.next(); parent.duoRandom = false; parent.logAction("CTRL palette next"); parent.dirtyGradient = true; parent.imgDirty = true; parent.redraw(); return; }
         if (bRot.hit(mouseX, mouseY))     { parent.logAction("CTRL rotate"); parent.rotatePalette(); parent.redraw(); return; }
@@ -881,6 +915,12 @@ public class ControlWindow extends PApplet {
           parent.redraw();
           return;
         }
+        if (tgMorphMode.hit(mouseX, mouseY)) {   // continuous per-tile random morphing (viz-thread apply)
+          tgMorphMode.value = !tgMorphMode.value; parent.morphMode = tgMorphMode.value;
+          parent.logAction("CTRL morphMode -> " + tgMorphMode.value);
+          parent.morphModeChanged = true; parent.redraw();
+          return;
+        }
         if (bMorph.hit(mouseX, mouseY)) {     // trigger a one-shot morph (runs on viz thread)
           parent.logAction("CTRL morph");
           parent.morphRequested = true; parent.redraw();
@@ -889,6 +929,18 @@ public class ControlWindow extends PApplet {
         if (bMorphStagger.hit(mouseX, mouseY)) {   // staggered morph (tiles finish at different times)
           parent.logAction("CTRL morph staggered");
           parent.morphStaggerRequested = true; parent.redraw();
+          return;
+        }
+        if (bMorphEase.hit(mouseX, mouseY)) {      // cycle the morph easing curve (easings.net)
+          parent.morphEasing = (parent.morphEasing + 1) % parent.MORPH_EASE_NAMES.length;
+          parent.logAction("CTRL morphEase -> " + parent.MORPH_EASE_NAMES[parent.morphEasing]);
+          parent.redraw();
+          return;
+        }
+        if (bMorphCap.hit(mouseX, mouseY)) {       // cycle the morph band-cap style (butt/round/square)
+          parent.morphCap = (parent.morphCap + 1) % parent.MORPH_CAP_NAMES.length;
+          parent.logAction("CTRL morphCap -> " + parent.MORPH_CAP_NAMES[parent.morphCap]);
+          parent.redraw();
           return;
         }
         break;
@@ -1070,7 +1122,14 @@ public class ControlWindow extends PApplet {
     parent.pulseSpeed     = sPulseSpeed.value;            // light-pulse params (no layout rebuild)
     parent.pulseTrail     = sPulseTrail.value;
     parent.pulseCount     = (int) sPulseCount.value;
-    parent.morphDurationSec = sMorphDur.value;
+    for (int i = 0; i < parent.MAX_MORPH_LV; i++)            // per-level morph duration
+      if (sMorphDurLv[i] != null) parent.morphDurLevel[i] = sMorphDurLv[i].value;
+    parent.morphProb      = sMorphProb.value;            // continuous-mode trigger rate (per tile/sec)
+    parent.wheelRate      = sWheelRate.value;             // gradient-wheel rotation speed (turns/sec)
+    if (sGradCx.value != parent.gradCx || sGradCy.value != parent.gradCy)
+      parent.dirtyGradient = true;                        // radial centre moved -> rebuild gradPaint (schemes 3/4)
+    parent.gradCx         = sGradCx.value;                // radial transient centre (normalised)
+    parent.gradCy         = sGradCy.value;
     parent.winged         = tgWinged.value;
     parent.invertPerLevel = tgInvert.value;
     parent.dropShadow     = tgShadow.value;
@@ -1111,7 +1170,12 @@ public class ControlWindow extends PApplet {
     sLineDuty.value   = parent.lineDuty;
     sLineSubdiv.value = parent.lineSubdivProb;
     sStripWidth.value = parent.stripWidthFrac;
-    sMorphDur.value   = parent.morphDurationSec;
+    for (int i = 0; i < parent.MAX_MORPH_LV; i++)
+      if (sMorphDurLv[i] != null) sMorphDurLv[i].value = parent.morphDurLevel[i];
+    sMorphProb.value  = parent.morphProb;
+    sWheelRate.value  = parent.wheelRate;
+    sGradCx.value     = parent.gradCx;
+    sGradCy.value     = parent.gradCy;
     sMetalBevel.value = parent.metalBevelPx;
     sMetalLight.value = parent.metalLightDeg;
     sImgCols.value  = parent.imgCols;
@@ -1130,12 +1194,15 @@ public class ControlWindow extends PApplet {
     tgImgStretch.value   = parent.imgStretch;
     tgImgInvert.value    = parent.imgInvert;
     tgImgContain.value   = parent.imgContain;
+    tgMorphMode.value    = parent.morphMode;
+    tgRadial.value       = parent.gradRadial;
   }
 }
 
 // ---- plain widget data holders ---------------------------------
 class Slider {
   String label; int colX, y; float lo, hi, value; boolean isInt; int tab = -1;
+  boolean visible = true;   // per-level morph-dur sliders hide above the current max depth
   Slider(String label, int colX, int y, float lo, float hi, float value, boolean isInt) {
     this.label = label; this.colX = colX; this.y = y; this.lo = lo; this.hi = hi;
     this.value = value; this.isInt = isInt;

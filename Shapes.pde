@@ -53,6 +53,11 @@ color   hexBatchFg;
 float   hexBatchSide;
 
 // ---- a polygon tile --------------------------------------------
+// Shared empty dot list returned by TileGeom.dotXY() for dot-free tiles (the common
+// case) so the fg/bundle/shadow passes don't each allocate a throwaway ArrayList.
+// Read-only by contract: callers only iterate it.
+final ArrayList<float[]> EMPTY_DOTS = new ArrayList<float[]>();
+
 class Tile {
   float cx, cy, R, rot;
   int n, depth;
@@ -64,6 +69,13 @@ class Tile {
   int miTo = 0, mkTo = 0;
   float morphOff = 0;         // staggered morph: this tile's start offset in [0, morphSpread]
                               // so tiles begin/finish at slightly different times (0 = in sync)
+  // Continuous "morph" mode (morphMode): each tile runs its OWN cross-dissolve.
+  // mphT is this tile's phase 0..1; morphCount counts the morphs it has started
+  // (folded into the target-roll hash so each successive morph rolls afresh, and
+  // so a structural-symmetry twin -- which fires on the same frame -- stays in
+  // lockstep). Both 0 for the one-shot path -> byte-identical there.
+  float mphT = 0;
+  int   morphCount = 0;
   boolean straddle = false;   // sits on a structural-symmetry axis (its own mirror) ->
                               // its morph target must be axis-symmetric (rollSymmetricTarget)
   boolean flip = false;   // mirror twin: reverse the vertex winding (see TileGeom),
@@ -77,6 +89,14 @@ class Tile {
   // gradient colour); n stays 4 (the polygon's vertex count, used for clip/fill).
   boolean trap = false;
   float p0x, p0y, ex, ey;   // canonical placement (complex p0 and e)
+  // Per-frame TileGeom cache (see geomFor). The animation snapshot (animBandScale,
+  // animRotOffset, morphT, ...) is frozen ONCE per frame in snapshotAnim(), so every
+  // render pass of a frame builds an identical TileGeom for a given tile -- yet the
+  // solid+shadow path constructs it 3x and line mode 4-5x. Caching it by frameCount
+  // collapses that to one build/frame (byte-identical within a frame, since the
+  // passes only READ the geom). geomFrame = -1 => not yet built.
+  TileGeom geom;
+  int geomFrame = -1;
   Tile(float cx, float cy, float R, float rot, int n, int depth) {
     this.cx = cx; this.cy = cy; this.R = R; this.rot = rot;
     this.n = n; this.depth = depth;
@@ -389,6 +409,11 @@ class TileGeom {
   float cxC, cyC;                  // polygon centre (interior anchor port)
   // trapezoid effective placement (p0,e with animRotOffset folded in about the centroid)
   float tpx, tpy, tex, tey;
+  // Reusable scratch path for morph truncation (appendMotifConnF/appendTrapConnF).
+  // A morphing tile truncates fractional conns every pass; reusing one path (reset,
+  // not reallocated) keeps that off the per-frame allocation hot path. Single viz
+  // thread + non-reentrant use -> safe to share across this geom's append calls.
+  Path2D.Float truncScratch;
 
   TileGeom(Tile t) {
     trap = t.trap;
@@ -399,8 +424,10 @@ class TileGeom {
     int[][][] alpha = connsFor(n);
     if (alpha == null) { dbg("NULL", "connsFor(" + n + ") null at k=" + anchorsPerSide + " mi=" + t.mi); alpha = BLANK_CONNS; }
     conns = (t.mi >= 0 && t.mi < alpha.length) ? alpha[t.mi] : new int[0][];   // mi = -1 -> blank tile
-    // one-shot morph: replace conns with the from+to union (+ per-conn fractions).
-    if (morphActive && (t.mi != t.miTo || t.mk != t.mkTo)) {
+    // morph (one-shot or continuous): replace conns with the from+to union (+
+    // per-conn fractions). The per-tile gate (mi/mk != target) means a non-
+    // morphing tile in continuous mode renders its plain motif.
+    if (morphRendering() && (t.mi != t.miTo || t.mk != t.mkTo)) {
       int[][] fromC = conns;
       int[][] toRaw = (t.miTo >= 0 && t.miTo < alpha.length) ? alpha[t.miTo] : new int[0][];
       int ds = t.mkTo - t.mk;
@@ -472,7 +499,7 @@ class TileGeom {
   // similarity (p0', e') with e' = e*e^{i*theta} and p0' = p0 + Cc*e - Cc*e'.
   void initTrap(Tile t) {
     conns = (t.mi >= 0 && t.mi < TRAP_CONNS.length) ? TRAP_CONNS[t.mi] : new int[0][];   // mi = -1 -> blank
-    if (morphActive && t.mi != t.miTo) {   // trapezoid morph (mk always 0, no relabel)
+    if (morphRendering() && t.mi != t.miTo) {   // trapezoid morph (mk always 0, no relabel)
       int[][] toC = (t.miTo >= 0 && t.miTo < TRAP_CONNS.length) ? TRAP_CONNS[t.miTo] : new int[0][];
       applyMorphUnion(t, conns, toC, morphLocalMix(t));
     }
@@ -524,14 +551,20 @@ class TileGeom {
     ArrayList<int[]> uc = new ArrayList<int[]>();
     ArrayList<Float> uf = new ArrayList<Float>();
     ArrayList<int[]> own = new ArrayList<int[]>();    // {mi, mk, ci} of the owning motif
+    // Precompute each side's canonical keys ONCE (vs rebuilding connKey on every
+    // pairwise comparison inside indexOfConn -> O(F*T) string allocations).
+    String[] fromK = new String[fromC.length];
+    for (int i = 0; i < fromC.length; i++) fromK[i] = connKey(fromC[i]);
+    String[] toK = new String[toC.length];
+    for (int i = 0; i < toC.length; i++) toK[i] = connKey(toC[i]);
     for (int ciF = 0; ciF < fromC.length; ciF++) {
-      int ciT = indexOfConn(toC, fromC[ciF]);
+      int ciT = idxOfKey(toK, fromK[ciF]);
       uc.add(fromC[ciF]);
       if (ciT >= 0) { uf.add(1.0);       own.add(new int[]{ t.miTo, t.mkTo, ciT }); }  // persistent -> target identity
       else          { uf.add(1.0 - mix); own.add(new int[]{ t.mi,   t.mk,   ciF }); }  // departing  -> source identity
     }
     for (int ciT = 0; ciT < toC.length; ciT++)
-      if (indexOfConn(fromC, toC[ciT]) < 0) { uc.add(toC[ciT]); uf.add(mix); own.add(new int[]{ t.miTo, t.mkTo, ciT }); }  // arriving -> target
+      if (idxOfKey(fromK, toK[ciT]) < 0) { uc.add(toC[ciT]); uf.add(mix); own.add(new int[]{ t.miTo, t.mkTo, ciT }); }  // arriving -> target
     conns = uc.toArray(new int[0][]);
     connFrac = new float[uf.size()];
     connOwnMi = new int[uf.size()]; connOwnMk = new int[uf.size()]; connOwnCi = new int[uf.size()];
@@ -565,6 +598,11 @@ class TileGeom {
     int lo = min(c[0], c[1]), hi = max(c[0], c[1]);
     boolean straight = (c.length >= 3 && c[2] == 1);
     return "P" + lo + "_" + hi + (straight ? "s" : "");
+  }
+  // Index of a precomputed key in a precomputed key array (-1 if absent).
+  int idxOfKey(String[] keys, String k) {
+    for (int i = 0; i < keys.length; i++) if (keys[i].equals(k)) return i;
+    return -1;
   }
   boolean containsConn(int[][] list, int[] c) { return indexOfConn(list, c) >= 0; }
   int indexOfConn(int[][] list, int[] c) {
@@ -609,18 +647,18 @@ class TileGeom {
     float f = (connFrac == null) ? 1 : connFrac[ci];
     if (f >= 1) { appendMotifConn(path, conns[ci], offset); return; }
     if (f <= 0) return;
-    Path2D.Float scratch = new Path2D.Float();
-    appendMotifConn(scratch, conns[ci], offset);
-    appendTruncated(path, scratch, f, connGrowEnd[ci]);
+    if (truncScratch == null) truncScratch = new Path2D.Float(); else truncScratch.reset();
+    appendMotifConn(truncScratch, conns[ci], offset);
+    appendTruncated(path, truncScratch, f, connGrowEnd[ci]);
   }
   void appendTrapConnF(Path2D.Float path, int ci, float offset) {
     int[] cn = conns[ci];
     float f = (connFrac == null) ? 1 : connFrac[ci];
     if (f >= 1) { appendTrapConn(path, cn[0], cn[1], offset); return; }
     if (f <= 0) return;
-    Path2D.Float scratch = new Path2D.Float();
-    appendTrapConn(scratch, cn[0], cn[1], offset);
-    appendTruncated(path, scratch, f, connGrowEnd[ci]);
+    if (truncScratch == null) truncScratch = new Path2D.Float(); else truncScratch.reset();
+    appendTrapConn(truncScratch, cn[0], cn[1], offset);
+    appendTruncated(path, truncScratch, f, connGrowEnd[ci]);
   }
 
   // Pulse path-tracing: the centre-line of connection ci as a flat polyline
@@ -689,9 +727,21 @@ class TileGeom {
   // drawn by the fill passes (foreground / shadow / extrude), like wing nubs.
   // {x, y, frac} per CONN_DOT (frac = morph reveal, 1 when not morphing). The fill
   // passes scale the disc radius by frac so a dot grows/shrinks with the morph.
+  // Cached "does this tile have any CONN_DOT?" so the (3x/frame) callers skip the
+  // ArrayList allocation entirely for the overwhelmingly common dot-free tile. The
+  // geom is cached per frame (geomFor), so this scan runs at most once per tile/frame.
+  Boolean _hasDots = null;
+  boolean hasDots() {
+    if (_hasDots == null) {
+      boolean h = false;
+      if (!trap) for (int ci = 0; ci < conns.length; ci++) if (conns[ci][0] == CONN_DOT) { h = true; break; }
+      _hasDots = h;
+    }
+    return _hasDots;
+  }
   ArrayList<float[]> dotXY() {
+    if (!hasDots()) return EMPTY_DOTS;        // shared, read-only (callers only iterate)
     ArrayList<float[]> out = new ArrayList<float[]>();
-    if (trap) return out;
     for (int ci = 0; ci < conns.length; ci++) if (conns[ci][0] == CONN_DOT) {
       float[] c = portXY(conns[ci][1]);
       out.add(new float[]{ c[0], c[1], (connFrac == null) ? 1 : connFrac[ci] });
@@ -811,15 +861,26 @@ class TileGeom {
 
 // Pass A: the tile's background -- polygon fill, then the background half of
 // the wings (bg disc at each vertex, r = side/3, unclipped so it spills).
+// Return tile `t`'s TileGeom for the current frame, building it at most once per
+// frame and caching it on the tile. All render passes of one frame read the same
+// per-frame animation snapshot, so the geom they each derived was identical -- this
+// just stops rebuilding it 3-5x per tile per frame (the dominant animation cost).
+// A new frame (frameCount advanced) or a freshly collected tile rebuilds it.
+int geomStamp = 0;   // bumped once per rendered frame (draw() top); the geom cache key
+TileGeom geomFor(Tile t) {
+  if (t.geomFrame != geomStamp) { t.geom = new TileGeom(t); t.geomFrame = geomStamp; }
+  return t.geom;
+}
+
 void drawTileBackground(Tile t, color bg) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   // background polygon. Skipped when it would only repaint the canvas colour and
   // could seam against neighbours:
-  //  (a) gradient-bg scheme (3): the smooth canvas gradient must show through;
+  //  (a) gradient-bg schemes (3 + wheel 5): the smooth canvas gradient must show through;
   //  (b) whole hexagons (n==6): a hexagon only ever exists at depth 0, so its bg
   //      always equals the canvas colour -- drawing the opaque polygon lets a
   //      later tile slice a 1px AA seam between overlapping bands at shared edges.
-  if (colorScheme != 3 && !gm.wholeHex) {
+  if (!schemeBgGradient() && !gm.wholeHex) {
     noStroke();
     fill(bg);
     beginShape();
@@ -851,7 +912,7 @@ void drawTileBackground(Tile t, color bg) {
 // against wide arcs); hexagon skips the clip so its ROUND-capped bands overlap
 // slightly across shared edges.
 void drawTileForeground(Tile t, color fg) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   if (gm.wholeHex && colorScheme != 2) {
     // whole hexagons (uniform colour): defer the bands into the shared batch
     // path so ALL hexagon bands are stroked once -> no inter-tile seams. Mode 2
@@ -886,13 +947,16 @@ void drawTileForeground(Tile t, color fg) {
       // grid/phase is what makes the rings and lines line up.
       Graphics2D g2 = ((PGraphicsJava2D) g).g2;
       g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_BUTT, BasicStroke.JOIN_ROUND));
-      g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+      g2.setPaint(gradientStroke() ? fgPaint() : awtColor(fg));
       float minR = linePitch() * 0.25;          // skip the ~0 (centre-line) ring
+      float[] ringOffs = lineOffsets(2 * fgR);  // identical for every port -> compute once
+      Ellipse2D.Float el = new Ellipse2D.Float();
       for (int k = 0; k < gm.fgWx.length; k++)
-        for (float off : lineOffsets(2 * fgR)) {
+        for (float off : ringOffs) {
           if (off <= minR) continue;             // positive half only
           float d = 2 * off;
-          g2.draw(new Ellipse2D.Float(gm.fgWx[k] - off, gm.fgWy[k] - off, d, d));
+          el.setFrame(gm.fgWx[k] - off, gm.fgWy[k] - off, d, d);
+          g2.draw(el);
         }
     } else {
       noStroke();
@@ -937,24 +1001,28 @@ void drawTileForeground(Tile t, color fg) {
 // target/spiral circles. Each port belongs to at most one connection, so the
 // solid/subdivided choice per port is unambiguous (see solidPorts).
 void drawTileLineRings(Tile t, color fg) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   if (!gm.wings) return;
   float fgR = gm.fgR0 * animDiscScale;
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
   g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_BUTT, BasicStroke.JOIN_ROUND));
-  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  g2.setPaint(gradientStroke() ? fgPaint() : awtColor(fg));
   boolean[] solidPort = solidPorts(gm, t);
   float minR = linePitch() * 0.25;            // skip the ~0 (centre-line) ring
+  float[] ringOffs = lineOffsets(2 * fgR);    // identical for every port -> compute once
+  Ellipse2D.Float el = new Ellipse2D.Float(); // reused; g2.draw/fill consume it synchronously
   for (int k = 0; k < gm.fgWx.length; k++) {
     if (solidPort[k]) {                        // solid stroke endpoint -> solid disc nub
       float dd = 2 * fgR;
-      g2.fill(new Ellipse2D.Float(gm.fgWx[k] - fgR, gm.fgWy[k] - fgR, dd, dd));
+      el.setFrame(gm.fgWx[k] - fgR, gm.fgWy[k] - fgR, dd, dd);
+      g2.fill(el);
       continue;
     }
-    for (float off : lineOffsets(2 * fgR)) {   // subdivided / unused -> concentric rings
+    for (float off : ringOffs) {               // subdivided / unused -> concentric rings
       if (off <= minR) continue;              // positive half only
       float dd = 2 * off;
-      g2.draw(new Ellipse2D.Float(gm.fgWx[k] - off, gm.fgWy[k] - off, dd, dd));
+      el.setFrame(gm.fgWx[k] - off, gm.fgWy[k] - off, dd, dd);
+      g2.draw(el);
     }
   }
 }
@@ -982,7 +1050,7 @@ boolean[] solidPorts(TileGeom gm, Tile t) {
 // the spiral cap. Whole hexagons (scheme != 2) keep their transparent batched
 // bundle, so they are skipped here.
 void drawTileRibbonBase(Tile t, color bg) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   if (!gm.hasBands()) return;
   if (gm.wholeHex && colorScheme != 2) return;
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
@@ -990,7 +1058,7 @@ void drawTileRibbonBase(Tile t, color bg) {
   java.awt.Shape oldClip = doClip ? pushPolyClip(gm.vx, gm.vy, gm.vx.length) : null;
   Path2D.Float path = new Path2D.Float();
   gm.appendBands(path);
-  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  int cap = bandCap(gm.wholeHex);
   g2.setPaint(awtColor(bg));
   g2.setStroke(new BasicStroke(gm.bandW * animBandScale, cap, BasicStroke.JOIN_ROUND));
   g2.draw(path);
@@ -1005,7 +1073,7 @@ void drawTileRibbonBase(Tile t, color bg) {
 // being opaque fg, cover the pass-2 ribbon base under them. Whole hexagons defer
 // into the shared batch paths exactly as drawTileForeground does.
 void drawTileLineBundle(Tile t, color fg) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   if (gm.wholeHex && colorScheme != 2) {
     for (int ci = 0; ci < gm.conns.length; ci++)
       if (gm.subdivided(t, ci))
@@ -1027,8 +1095,8 @@ void drawTileLineBundle(Tile t, color fg) {
     else
       gm.appendOneBand(solid, ci, 0);
   }
-  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
-  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  g2.setPaint(gradientStroke() ? fgPaint() : awtColor(fg));
+  int cap = bandCap(gm.wholeHex);
   g2.setStroke(bandStroke(gm.bandW, gm.side, cap));
   g2.draw(solid);
   g2.setStroke(new BasicStroke(lineStroke(), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -1089,12 +1157,12 @@ Graphics2D beginShadowLayer() {
 }
 
 void addTileShadow(Graphics2D sg, Tile t) {
-  TileGeom gm = new TileGeom(t);
+  TileGeom gm = geomFor(t);
   float off = shadowSize * gm.bandW;
   AffineTransform oldT = sg.getTransform();
   sg.translate(off * cos(shadowAngle), off * sin(shadowAngle));
   if (gm.hasBands()) {
-    int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+    int cap = bandCap(gm.wholeHex);
     Path2D.Float bands = new Path2D.Float(), thin = new Path2D.Float();
     gm.appendBandsSplit(bands, thin);
     sg.setStroke(new BasicStroke(gm.bandW * animBandScale, cap, BasicStroke.JOIN_ROUND));
@@ -1153,7 +1221,7 @@ void drawExtrudeLevel(int d) {
   float repSide = 0, repBandW = 0; boolean repWholeHex = false; boolean any = false, anyThin = false;
   for (Tile lf : leaves) {
     if (lf.depth != d) continue;
-    TileGeom gm = new TileGeom(lf);
+    TileGeom gm = geomFor(lf);
     gm.appendBandsSplit(bands, thin);
     if (gm.hasThinMotif()) anyThin = true;
     float r = gm.fgR0 * animDiscScale;
@@ -1165,7 +1233,7 @@ void drawExtrudeLevel(int d) {
   if (!any) return;
   float depthPx = extrudeDepth * repSide;       // depth scales with tile size
   if (depthPx < 0.5) return;
-  int cap = repWholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
+  int cap = bandCap(repWholeHex);
 
   float bandW  = repBandW * animBandScale;
   float motifW = anyThin ? max(0.75, repSide / (10.0 * anchorsPerSide) * animBandScale) : 0;
@@ -1239,10 +1307,12 @@ void compositeExtrudeLayer(Graphics2D sg) {
   g2.setComposite(old);
 }
 
-// True when bands should be painted with the canvas-wide gradient (scheme 4),
-// so each band's colour varies continuously across the canvas, not per tile.
+// True when bands should be painted with a canvas-wide gradient (so each band's
+// colour varies continuously across the canvas, not per tile): the static linear
+// gradient (scheme 4) or the animated cyclic wheel (schemes 5/6, via wheelFgPaint).
 boolean gradientStroke() {
   if (colorScheme == 4 && gradPaint == null) dbg("NULL", "gradPaint null in scheme 4 (gradient-smooth)");
+  if (schemeWheelFg()) return wheelFgPaint != null;
   return colorScheme == 4 && gradPaint != null;
 }
 
@@ -1255,6 +1325,18 @@ boolean gradientStroke() {
 // ROUND join. Kumiko style: a thin uniform strip (stripWidthFrac * side) with a
 // SQUARE cap + MITER join, the sharp woodwork-lattice look. animBandScale is
 // applied here so the one identity (off -> width = bandW * scale) stays exact.
+// Cap for a tile's full-thickness band strokes. Whole hexagons overlap across
+// edges (ROUND); square/triangle/trapezoid end flush at edges (BUTT) and rely on
+// the clip + wings to bridge. While a one-shot morph plays, a band's growing/
+// retracting end is an INTERIOR truncation, so morphCap rounds/squares it (the
+// clip still flattens any true edge-ending band, so the edge invariant holds).
+// Off / no morph => CAP_BUTT, byte-identical to before.
+int bandCap(boolean wholeHex) {
+  if (wholeHex) return BasicStroke.CAP_ROUND;
+  if (morphRendering() && morphCap != 0) return MORPH_CAP_AWT[morphCap];
+  return BasicStroke.CAP_BUTT;
+}
+
 BasicStroke bandStroke(float bandW, float side, int cap) {
   if (kumikoStyle)
     return new BasicStroke(max(0.5, stripWidthFrac * side * animBandScale),
@@ -1267,8 +1349,8 @@ void drawTileBands(TileGeom gm, color fg) {
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
   // hexagon bands overlap across edges with a ROUND cap (no clip there); square/
   // triangle/trapezoid end flush (CAP_BUTT) and rely on wings to bridge the edge.
-  int cap = gm.wholeHex ? BasicStroke.CAP_ROUND : BasicStroke.CAP_BUTT;
-  g2.setPaint(gradientStroke() ? gradPaint : awtColor(fg));
+  int cap = bandCap(gm.wholeHex);
+  g2.setPaint(gradientStroke() ? fgPaint() : awtColor(fg));
   if (lineMode) {                             // bundle of thin parallel/concentric lines
     Path2D.Float lines = new Path2D.Float();
     for (float off : lineOffsets(lineBundleW(gm))) gm.appendBandsOffset(lines, off);
@@ -1294,7 +1376,7 @@ void drawTileBands(TileGeom gm, color fg) {
 void strokeHexBatch() {
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
   float hw = lineMode ? lineStroke() : hexBatchSide / 3.0 * animBandScale;   // bundle already in hexBatch
-  g2.setPaint(gradientStroke() ? gradPaint : awtColor(hexBatchFg));
+  g2.setPaint(gradientStroke() ? fgPaint() : awtColor(hexBatchFg));
   // line mode: full-thickness strokes that opted out of subdivision, stroked at side/3.
   if (lineMode) {
     g2.setStroke(new BasicStroke(hexBatchSide / 3.0 * animBandScale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -1505,42 +1587,60 @@ int rotPortFull(int p, int ds, int n, int k) {
 // (0<frac<1) of its own arc-length -- a connection growing along its path. growEnd
 // 0 grows from the subpath start, 1 from its end (so a band grows from its anchored
 // port). frac>=1 is handled by the caller (verbatim, byte-identical).
+// Reusable subpath coordinate buffers (single viz thread, non-reentrant) so a morph
+// truncation doesn't allocate a float[2] per point + an ArrayList every pass.
+float[] _truncXs = new float[64], _truncYs = new float[64];
+void growTruncBufs(int need) {
+  int cap = _truncXs.length;
+  while (cap < need) cap *= 2;
+  _truncXs = java.util.Arrays.copyOf(_truncXs, cap);
+  _truncYs = java.util.Arrays.copyOf(_truncYs, cap);
+}
 void appendTruncated(Path2D.Float dst, Path2D.Float src, float frac, int growEnd) {
   java.awt.geom.PathIterator it = src.getPathIterator(null);
   float[] co = new float[6];
-  ArrayList<float[]> sub = new ArrayList<float[]>();
+  int m = 0;                                   // points buffered for the current subpath
   while (!it.isDone()) {
     int type = it.currentSegment(co);
     if (type == java.awt.geom.PathIterator.SEG_MOVETO) {
-      if (!sub.isEmpty()) { emitTrunc(dst, sub, frac, growEnd); sub = new ArrayList<float[]>(); }
-      sub.add(new float[]{ co[0], co[1] });
+      if (m > 0) { emitTrunc(dst, m, frac, growEnd); m = 0; }
+      if (m >= _truncXs.length) growTruncBufs(m + 1);
+      _truncXs[m] = co[0]; _truncYs[m] = co[1]; m++;
     } else if (type == java.awt.geom.PathIterator.SEG_LINETO) {
-      sub.add(new float[]{ co[0], co[1] });
+      if (m >= _truncXs.length) growTruncBufs(m + 1);
+      _truncXs[m] = co[0]; _truncYs[m] = co[1]; m++;
     }
     // SEG_CLOSE: the closing edge is already represented (appendCircle repeats the
     // first point at q==seg), so a truncated ring is just a leading open arc.
     it.next();
   }
-  if (!sub.isEmpty()) emitTrunc(dst, sub, frac, growEnd);
+  if (m > 0) emitTrunc(dst, m, frac, growEnd);
 }
-void emitTrunc(Path2D.Float dst, ArrayList<float[]> pts, float frac, int growEnd) {
-  int m = pts.size();
+// Emit the first `m` points of _truncXs/_truncYs truncated to a leading `frac` of
+// their arc length. growEnd 0 grows from the start, 1 from the end (walk reversed) --
+// identical arithmetic to the old ArrayList path, just index-driven (byte-identical).
+void emitTrunc(Path2D.Float dst, int m, float frac, int growEnd) {
   if (m < 2) return;
-  if (growEnd == 1) java.util.Collections.reverse(pts);
+  int first = (growEnd == 1) ? m - 1 : 0;       // walk reversed when growing from the end
+  int step  = (growEnd == 1) ? -1 : 1;
   float total = 0;
-  for (int i = 1; i < m; i++) total += dist(pts.get(i-1)[0], pts.get(i-1)[1], pts.get(i)[0], pts.get(i)[1]);
+  for (int k = 1; k < m; k++) {
+    int ia = first + step * (k - 1), ib = first + step * k;
+    total += dist(_truncXs[ia], _truncYs[ia], _truncXs[ib], _truncYs[ib]);
+  }
   float target = total * frac;
-  dst.moveTo(pts.get(0)[0], pts.get(0)[1]);
+  dst.moveTo(_truncXs[first], _truncYs[first]);
   float acc = 0;
-  for (int i = 1; i < m; i++) {
-    float[] a = pts.get(i-1), b = pts.get(i);
-    float seg = dist(a[0], a[1], b[0], b[1]);
+  for (int k = 1; k < m; k++) {
+    int ia = first + step * (k - 1), ib = first + step * k;
+    float ax = _truncXs[ia], ay = _truncYs[ia], bx = _truncXs[ib], by = _truncYs[ib];
+    float seg = dist(ax, ay, bx, by);
     if (acc + seg >= target) {
       float u = (target - acc) / max(1e-6, seg);
-      dst.lineTo(a[0] + (b[0]-a[0]) * u, a[1] + (b[1]-a[1]) * u);
+      dst.lineTo(ax + (bx - ax) * u, ay + (by - ay) * u);
       return;
     }
-    dst.lineTo(b[0], b[1]); acc += seg;
+    dst.lineTo(bx, by); acc += seg;
   }
 }
 
@@ -1585,7 +1685,7 @@ Color awtColor(color c) {
 // Fill a disc with the gradient paint (gradient-smooth wing edge-midpoint discs).
 void fillDiscG2(float cx, float cy, float r) {
   Graphics2D g2 = ((PGraphicsJava2D) g).g2;
-  g2.setPaint(gradPaint);
+  g2.setPaint(fgPaint());
   g2.fill(new Ellipse2D.Float(cx - r, cy - r, 2 * r, 2 * r));
 }
 
